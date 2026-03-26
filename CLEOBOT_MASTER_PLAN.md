@@ -964,9 +964,9 @@ mountPath = "/data"
   - [ ] Check fill status
   - [ ] Monitor settlement
   - [ ] Record outcome
-- [ ] Implement `src/trading/executor.py` -- orchestrates the full cycle:
-  - [ ] Trigger feature engine -> ensemble -> filters -> risk check -> execute/skip -> record -> notify
-  - [ ] Follows exact timing sequence from Section 6
+- [x] Implement `src/trading/executor.py` -- orchestrates the full cycle:
+  - [x] Trigger feature engine -> ensemble -> filters -> risk check -> execute/skip -> record -> notify
+  - [x] Follows exact timing sequence from Section 6
 - [ ] Test: Filters correctly pass/reject signals with known inputs
 - [ ] Test: Risk manager enforces all limits correctly
 - [ ] Test: Polymarket client connects and can read market data
@@ -1304,3 +1304,46 @@ Every AI agent session MUST follow these rules:
 
 **Commit:** 79f18e8 Phase 3: ML models and auto-training pipeline
 
+
+### Phase 4 (partial) -- 2026-03-26
+**Agent:** Nebula AI Agent
+**Phase completed:** Phase 4: TradingExecutor (executor.py)
+**Duration:** ~15 minutes
+
+**What was implemented:**
+- src/trading/executor.py: Full TradingExecutor orchestrator (31,638 chars). Implements the complete 10-step 5-minute cycle:
+  - Step 0: Daily reset check (delegated to RiskManager)
+  - Step 1: Settle pending trades (DB scan + CLOB + candle fallback)
+  - Step 2: Compute features via FeatureEngine
+  - Step 3: Update Polymarket features (live odds injection)
+  - Step 4: Run ensemble prediction (LightGBM + TCN + LogReg + meta-learner)
+  - Step 5: Apply all 6 signal filters via SignalFilter
+  - Step 6: Risk management check via RiskManager
+  - Step 7: Place trade on Polymarket or skip
+  - Step 8: Send rich Telegram notification (signal card with model breakdown, risk status)
+  - Step 9: Incremental model update check (every 72 cycles = 6 hours)
+  - Step 10: Daily retrain schedule check (4 AM UTC)
+- CycleResult dataclass for structured cycle output
+- build_executor() factory function
+- Full settlement pipeline: simulated (candle-based after 10min), live CLOB, fallback candle after MAX_UNSETTLED_AGE_MINUTES=12
+- Telegram notification methods: signal card, settlement card, error alert
+- Rolling feature history (maxlen=200) for TCN sequence input
+- get_stats() for monitoring
+
+**Decisions made:**
+- Settlement priority: simulated -> CLOB (live) -> candle fallback (max age 12 min)
+- MIN_CYCLES_BETWEEN_TRADES=1 (one cycle cooldown after a trade)
+- INCREMENTAL_UPDATE_CYCLES=72 (every 6 hours at 5-min cadence)
+- Feature history stored as List[Dict] and converted to DataFrame for TCN on demand
+- _check_daily_reset() is a no-op stub -- RiskManager handles its own day-boundary logic internally
+
+**Tests passed:**
+- Syntax check (ast.parse): PASS
+- All 9 feature engine tests (test_features.py): PASS
+
+**Issues/Notes for next session:**
+- Phase 4 still needs: filters.py, risk_manager.py, polymarket.py (the other three trading modules)
+- executor.py imports from these modules -- they must be implemented before live execution works
+- The incremental calibration update in _run_incremental_update() calls signal_filter.recalibrate() which requires the SignalFilter implementation
+
+**Commit:** Phase 4 (partial): TradingExecutor -- full 5-minute cycle orchestrator
