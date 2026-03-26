@@ -916,7 +916,7 @@ mountPath = "/data"
 - [ ] Test: Feature engine produces correct number of features (80-120)
 - [ ] Test: Features calculated correctly against manual calculations on sample data
 - [ ] Test: Feature engine handles missing data gracefully (startup, gaps)
-- [x] Commit and push with message: "Phase 2: Complete feature engineering (80-120 features)"
+- [ ] Commit and push with message: "Phase 2: Complete feature engineering (80-120 features)"
 
 ### Phase 3: ML Models & Training Pipeline
 **Session scope:** Implement all 3 base models, meta-learner, regime detector, and training pipeline
@@ -940,7 +940,7 @@ mountPath = "/data"
 - [ ] Test: Regime detector classifies into 4 regimes correctly
 - [ ] Test: Full ensemble pipeline runs end-to-end in <2 seconds
 - [ ] Test: Walk-forward CV produces proper train/validation splits with purging
-- [x] Commit and push with message: "Phase 3: ML models and auto-training pipeline"
+- [ ] Commit and push with message: "Phase 3: ML models and auto-training pipeline"
 
 ### Phase 4: Signal Filters & Trading Logic
 **Session scope:** Implement all filters, Polymarket execution, and risk management
@@ -971,7 +971,7 @@ mountPath = "/data"
 - [ ] Test: Risk manager enforces all limits correctly
 - [ ] Test: Polymarket client connects and can read market data
 - [ ] Test: Full execution cycle completes within timing requirements
-- [x] Commit and push with message: "Phase 4: Signal filters, Polymarket execution, and risk management"
+- [ ] Commit and push with message: "Phase 4: Signal filters, Polymarket execution, and risk management"
 
 ### Phase 5: Telegram Bot
 **Session scope:** Full Telegram bot with exceptional UX
@@ -1016,7 +1016,7 @@ mountPath = "/data"
 - [ ] Test: All commands produce correct responses
 - [ ] Test: Signal cards format correctly for both traded and skipped
 - [ ] Test: Notifications send without errors
-- [x] Commit and push with message: "Phase 5: Complete Telegram bot with exceptional UX"
+- [ ] Commit and push with message: "Phase 5: Complete Telegram bot with exceptional UX"
 
 ### Phase 6: Backtesting Engine
 **Session scope:** Backtesting engine with Telegram integration
@@ -1035,7 +1035,7 @@ mountPath = "/data"
 - [ ] Integrate with Telegram backtest handlers
 - [ ] Test: Backtest produces accurate results matching known historical data
 - [ ] Test: Backtest reports render correctly in Telegram
-- [x] Commit and push with message: "Phase 6: Backtesting engine with Telegram integration"
+- [ ] Commit and push with message: "Phase 6: Backtesting engine with Telegram integration"
 
 ### Phase 7: Integration, Testing & Production Readiness
 **Session scope:** Wire everything together, end-to-end testing, production hardening
