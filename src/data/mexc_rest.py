@@ -258,12 +258,8 @@ class MEXCRestClient:
         Returns:
             Dict with 'rate', 'timestamp', and 'next_settlement', or None on failure.
         """
-        # MEXC futures funding rate endpoint
-        params = {"symbol": f"{self.symbol}_USDT"}
-
-        data = await self._request(
-            "GET", "/api/v3/ticker/price", params={"symbol": self.symbol}
-        )
+        # MEXC futures uses underscore symbol format (e.g. BTC_USDT)
+        futures_symbol = self.symbol.replace("USDT", "_USDT")
 
         # Try the futures API for funding rate
         funding_data = None
@@ -271,7 +267,7 @@ class MEXCRestClient:
             session = await self._get_session()
             await self._rate_limit()
             async with session.get(
-                f"https://contract.mexc.com/api/v1/contract/funding_rate/{self.symbol}",
+                f"https://contract.mexc.com/api/v1/contract/funding_rate/{futures_symbol}",
             ) as response:
                 if response.status == 200:
                     result = await response.json()
@@ -345,8 +341,8 @@ class MEXCRestClient:
 
                 for item in items:
                     try:
-                        # MEXC returns settlementTime in ms, fundingRate as string/float
-                        ts_ms = int(item.get("settlementTime", 0))
+                        # MEXC returns settleTime in ms, fundingRate as string/float
+                        ts_ms = int(item.get("settleTime", 0))
                         rate = float(item.get("fundingRate", 0.0))
                         if ts_ms > 0:
                             all_records.append({

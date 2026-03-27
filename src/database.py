@@ -116,7 +116,7 @@ class Database:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS funding_rates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL UNIQUE,
                     rate REAL NOT NULL,
                     next_settlement INTEGER
                 )
@@ -398,7 +398,7 @@ class Database:
         """
         with self.get_cursor() as cursor:
             cursor.execute(
-                "INSERT INTO funding_rates (timestamp, rate, next_settlement) "
+                "INSERT OR IGNORE INTO funding_rates (timestamp, rate, next_settlement) "
                 "VALUES (?, ?, ?)",
                 (timestamp, rate, next_settlement),
             )
