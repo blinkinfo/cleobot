@@ -35,7 +35,7 @@ DEFAULT_PARAMS = {
     "lambda_l1": 0.1,
     "lambda_l2": 0.1,
     "verbose": -1,
-    "n_jobs": -1,
+    "n_jobs": 1,
     "seed": 42,
 }
 
@@ -367,7 +367,7 @@ class LightGBMModel:
                 "lambda_l1": trial.suggest_float("lambda_l1", 1e-3, 10.0, log=True),
                 "lambda_l2": trial.suggest_float("lambda_l2", 1e-3, 10.0, log=True),
                 "verbose": -1,
-                "n_jobs": -1,
+                "n_jobs": 1,
                 "seed": 42,
             }
 

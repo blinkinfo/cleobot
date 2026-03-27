@@ -49,7 +49,7 @@ PURGE_CANDLES = 2            # Gap between train and validation
 CANDLES_PER_DAY = 288        # 5-min candles per day
 DATA_LOAD_DAYS = 30          # Days of raw candles to load (covers train+val+lookback)
 FEATURE_LOOKBACK_CANDLES = 150  # Candles consumed by feature computation lookback
-OPTUNA_TRIALS = 50           # Trials per model
+OPTUNA_TRIALS = 20           # Trials per model (reduced from 50; TPE converges well within 20)
 ACCEPTANCY_MARGIN = 0.005    # New model must beat old by 0.5%
 DECAY_ACCURACY_FLOOR = 0.53  # Below this, accept any improvement
 SMOTE_MIN_SAMPLES = 50       # Minimum samples for SMOTE
@@ -448,11 +448,53 @@ class Trainer:
         )
         return combined_df
 
+    @staticmethod
+    def _rolling_linear_slope(arr: np.ndarray, window: int) -> np.ndarray:
+        """Compute rolling linear-regression slope using vectorized numpy ops.
+
+        Uses the closed-form OLS slope formula:
+          slope = (n * sum(x*y) - sum(x)*sum(y)) / (n * sum(x^2) - sum(x)^2)
+        where x = 0..window-1 for each window position.
+
+        Args:
+            arr: 1-D float array of values.
+            window: Rolling window size.
+
+        Returns:
+            Array of slopes, same length as arr. Positions with insufficient
+            history are filled with 0.0.
+        """
+        n = len(arr)
+        slopes = np.zeros(n, dtype=np.float64)
+        if n < window or window < 2:
+            return slopes
+
+        # Fixed x-values: 0, 1, ..., window-1
+        x = np.arange(window, dtype=np.float64)
+        sum_x = x.sum()
+        sum_x2 = (x * x).sum()
+        denom = window * sum_x2 - sum_x * sum_x
+
+        # Cumulative sums for rolling computation
+        cum_y = np.cumsum(arr)
+        idx = np.arange(n, dtype=np.float64)
+        cum_xy = np.cumsum(idx * arr)
+
+        for j in range(window - 1, n):
+            i_start = j - window + 1
+            s_y = cum_y[j] - (cum_y[i_start - 1] if i_start > 0 else 0.0)
+            s_xy = cum_xy[j] - (cum_xy[i_start - 1] if i_start > 0 else 0.0)
+            s_local_xy = s_xy - i_start * s_y
+            slopes[j] = (window * s_local_xy - sum_x * s_y) / denom
+
+        return slopes
+
     def _vectorized_cross_tf(self, df: pd.DataFrame, start_idx: int) -> pd.DataFrame:
         """Compute cross-timeframe features vectorized, matching inference feature names.
 
-        Uses 5m data to approximate 15m/1h timeframe features. Feature names
-        and value ranges match compute_cross_tf_features() from cross_tf_features.py.
+        Uses 5m data to approximate 15m/1h timeframe features with pure numpy
+        array operations (no per-row Python loop). Feature names and value
+        ranges match compute_cross_tf_features() from cross_tf_features.py.
 
         Args:
             df: Full 5m candle DataFrame.
@@ -461,100 +503,90 @@ class Trainer:
         Returns:
             DataFrame with cross-TF features for rows [start_idx:].
         """
-        close = df["close"].values.astype(float)
-        high = df["high"].values.astype(float)
-        low = df["low"].values.astype(float)
-        opn = df["open"].values.astype(float)
-        n_out = len(df) - start_idx
+        close = df["close"].values.astype(np.float64)
+        high = df["high"].values.astype(np.float64)
+        low = df["low"].values.astype(np.float64)
+        opn = df["open"].values.astype(np.float64)
+        n_total = len(close)
+        sl = slice(start_idx, n_total)
 
-        # Pre-allocate output arrays
-        tf15m_direction = np.zeros(n_out)
-        tf1h_direction = np.zeros(n_out)
-        tf_alignment_score = np.zeros(n_out)
-        tf15m_rsi = np.full(n_out, 50.0)
-        tf1h_rsi = np.full(n_out, 50.0)
-        tf_vol_ratio = np.ones(n_out)
-        tf15m_trend_strength = np.zeros(n_out)
-        tf1h_trend_strength = np.zeros(n_out)
-        tf1h_sr_proximity = np.full(n_out, 0.5)
-        tf_momentum_alignment = np.zeros(n_out)
+        # --- 1. 15m direction (3-candle window) ---
+        tf15m_direction = np.where(close[sl] > np.roll(opn, 2)[sl], 1.0, -1.0)
 
-        for out_i, i in enumerate(range(start_idx, len(df))):
-            # 1. 15m direction: approximate from 3-candle window (=15min)
-            if i >= 2:
-                # Use open of 3 candles ago vs close of current as proxy for 15m candle
-                open_15m = opn[i - 2]
-                close_15m = close[i]
-                tf15m_direction[out_i] = 1.0 if close_15m > open_15m else -1.0
-            
-            # 2. 1h direction: approximate from 12-candle window (=1h)
-            if i >= 11:
-                open_1h = opn[i - 11]
-                close_1h = close[i]
-                tf1h_direction[out_i] = 1.0 if close_1h > open_1h else -1.0
+        # --- 2. 1h direction (12-candle window) ---
+        tf1h_direction = np.where(close[sl] > np.roll(opn, 11)[sl], 1.0, -1.0)
 
-            # 3. Alignment: does 5m direction match 15m and 1h?
-            dir_5m = 1.0 if close[i] > opn[i] else -1.0
-            alignment = 0
-            if tf15m_direction[out_i] == dir_5m:
-                alignment += 1
-            if tf1h_direction[out_i] == dir_5m:
-                alignment += 1
-            tf_alignment_score[out_i] = float(alignment)
+        # --- 3. 5m direction & alignment score ---
+        dir_5m = np.where(close[sl] > opn[sl], 1.0, -1.0)
+        tf_alignment_score = ((tf15m_direction == dir_5m).astype(np.float64)
+                              + (tf1h_direction == dir_5m).astype(np.float64))
 
-            # 4. 15m RSI (EWM approximation using 15 5m candles)
-            if i >= 14:
-                rets = np.diff(close[i - 14: i + 1])
-                gains = rets[rets > 0]
-                losses = -rets[rets < 0]
-                avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
-                avg_loss = np.mean(losses) if len(losses) > 0 else 1e-8
-                rs = avg_gain / max(avg_loss, 1e-8)
-                tf15m_rsi[out_i] = 100.0 - (100.0 / (1.0 + rs))
+        # --- 4 & 5. RSI helpers (vectorized via cumsum of gains/losses) ---
+        def _rolling_rsi(prices: np.ndarray, period: int) -> np.ndarray:
+            rets = np.diff(prices, prepend=prices[0])
+            gains = np.where(rets > 0, rets, 0.0)
+            losses = np.where(rets < 0, -rets, 0.0)
+            cum_g = np.cumsum(gains)
+            cum_l = np.cumsum(losses)
+            n = len(prices)
+            rsi = np.full(n, 50.0)
+            for j in range(period, n):
+                sg = cum_g[j] - cum_g[j - period]
+                sl_ = cum_l[j] - cum_l[j - period]
+                if sl_ < 1e-12:
+                    rsi[j] = 100.0 if sg > 0 else 50.0
+                else:
+                    rs = sg / sl_
+                    rsi[j] = 100.0 - 100.0 / (1.0 + rs)
+            return rsi
 
-            # 5. 1h RSI (EWM approximation using 60 5m candles)
-            if i >= 59:
-                rets = np.diff(close[i - 59: i + 1])
-                gains = rets[rets > 0]
-                losses = -rets[rets < 0]
-                avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
-                avg_loss = np.mean(losses) if len(losses) > 0 else 1e-8
-                rs = avg_gain / max(avg_loss, 1e-8)
-                tf1h_rsi[out_i] = 100.0 - (100.0 / (1.0 + rs))
+        tf15m_rsi = _rolling_rsi(close, 15)[sl]
+        tf1h_rsi = _rolling_rsi(close, 60)[sl]
 
-            # 6. Volatility ratio: 5m ATR / 1h ATR approximation
-            if i >= 11:
-                atr_5m = np.mean(np.abs(np.diff(close[max(0, i - 5): i + 1])))
-                atr_1h = np.mean(np.abs(np.diff(close[max(0, i - 11): i + 1])))
-                tf_vol_ratio[out_i] = atr_5m / max(atr_1h, 1e-8)
+        # --- 6. Volatility ratio: rolling mean |diff| over 6 / over 12 candles ---
+        abs_diff = np.abs(np.diff(close, prepend=close[0]))
+        cum_ad = np.cumsum(abs_diff)
 
-            # 7. 15m trend strength (EMA proxy: slope over 3 candles / mean price)
-            if i >= 2:
-                window = close[i - 2: i + 1]
-                x = np.arange(3)
-                coeffs = np.polyfit(x, window, 1)
-                tf15m_trend_strength[out_i] = coeffs[0] / max(np.mean(window), 1e-8)
+        def _rolling_mean_ad(cum: np.ndarray, w: int) -> np.ndarray:
+            out = np.ones(n_total)
+            for j in range(w, n_total):
+                out[j] = (cum[j] - cum[j - w]) / w
+            return out
 
-            # 8. 1h trend strength (slope over 12 candles / mean price)
-            if i >= 11:
-                window = close[i - 11: i + 1]
-                x = np.arange(12)
-                coeffs = np.polyfit(x, window, 1)
-                tf1h_trend_strength[out_i] = coeffs[0] / max(np.mean(window), 1e-8)
+        atr5m = _rolling_mean_ad(cum_ad, 6)
+        atr1h = _rolling_mean_ad(cum_ad, 12)
+        tf_vol_ratio = (atr5m / np.maximum(atr1h, 1e-8))[sl]
 
-            # 9. S/R proximity (position between 1h swing high/low)
-            if i >= 11:
-                recent_high = np.max(high[i - 11: i + 1])
-                recent_low = np.min(low[i - 11: i + 1])
-                price_range = recent_high - recent_low
-                if price_range > 0:
-                    tf1h_sr_proximity[out_i] = (close[i] - recent_low) / price_range
+        # --- 7 & 8. Trend strength via rolling linear slope ---
+        slopes_all = self._rolling_linear_slope(close, 3)
+        cum_close = np.cumsum(close)
+        mean3 = np.ones(n_total)
+        for j in range(2, n_total):
+            mean3[j] = (cum_close[j] - (cum_close[j - 3] if j >= 3 else 0.0)) / min(j + 1, 3)
+        tf15m_trend_strength = (slopes_all / np.maximum(mean3, 1e-8))[sl]
 
-            # 10. Momentum alignment: +1 all up, -1 all down, 0 mixed
-            dirs = [dir_5m, tf15m_direction[out_i], tf1h_direction[out_i]]
-            nonzero = [d for d in dirs if d != 0]
-            if len(nonzero) == 3 and len(set(nonzero)) == 1:
-                tf_momentum_alignment[out_i] = nonzero[0]
+        slopes12 = self._rolling_linear_slope(close, 12)
+        mean12 = np.ones(n_total)
+        for j in range(11, n_total):
+            mean12[j] = (cum_close[j] - (cum_close[j - 12] if j >= 12 else 0.0)) / min(j + 1, 12)
+        tf1h_trend_strength = (slopes12 / np.maximum(mean12, 1e-8))[sl]
+
+        # --- 9. S/R proximity (position in 12-candle high-low range) ---
+        high_s = pd.Series(high)
+        low_s = pd.Series(low)
+        roll_high = high_s.rolling(12, min_periods=1).max().values
+        roll_low = low_s.rolling(12, min_periods=1).min().values
+        price_range = roll_high - roll_low
+        tf1h_sr_proximity = np.where(
+            price_range[sl] > 0,
+            (close[sl] - roll_low[sl]) / price_range[sl],
+            0.5,
+        )
+
+        # --- 10. Momentum alignment: +1 all up, -1 all down, 0 mixed ---
+        all_up = (dir_5m == 1.0) & (tf15m_direction == 1.0) & (tf1h_direction == 1.0)
+        all_down = (dir_5m == -1.0) & (tf15m_direction == -1.0) & (tf1h_direction == -1.0)
+        tf_momentum_alignment = np.where(all_up, 1.0, np.where(all_down, -1.0, 0.0))
 
         return pd.DataFrame({
             "tf15m_direction": tf15m_direction,
@@ -1199,7 +1231,7 @@ class Trainer:
         param_space = LightGBMModel().get_optuna_param_space()
 
         # Use a subset of splits for speed (last 3)
-        eval_splits = splits[-3:] if len(splits) > 3 else splits
+        eval_splits = splits[-2:] if len(splits) > 2 else splits
 
         # --- OPT 1: Pre-cache SMOTE for each fold ONCE before all trials ---
         # SMOTE depends only on (X_tr, y_tr), not on hyperparameters, so it
@@ -1226,8 +1258,8 @@ class Trainer:
                 model = LightGBMModel(params=params)
                 metrics = model.train(
                     X_tr_sm, y_tr_sm, X_vl, y_vl,
-                    num_boost_round=150,
-                    early_stopping_rounds=30,
+                    num_boost_round=80,
+                    early_stopping_rounds=20,
                 )
                 accuracies.append(metrics["val_accuracy"])
 
