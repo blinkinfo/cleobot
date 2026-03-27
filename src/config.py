@@ -44,15 +44,9 @@ class TelegramConfig:
 
 @dataclass(frozen=True)
 class MEXCConfig:
-    api_key: str = ""
-    secret_key: str = ""
     base_url_rest: str = "https://api.mexc.com"
     ws_url: str = "wss://wbs.mexc.com/ws"
     symbol: str = "BTCUSDT"
-
-    @property
-    def is_configured(self) -> bool:
-        return bool(self.api_key and self.secret_key)
 
 
 @dataclass(frozen=True)
@@ -130,10 +124,7 @@ def load_config() -> Config:
             bot_token=_get_env("TELEGRAM_BOT_TOKEN", ""),
             chat_id=_get_env("TELEGRAM_CHAT_ID", ""),
         ),
-        mexc=MEXCConfig(
-            api_key=_get_env("MEXC_API_KEY", ""),
-            secret_key=_get_env("MEXC_SECRET_KEY", ""),
-        ),
+        mexc=MEXCConfig(),
         polymarket=PolymarketConfig(
             private_key=_get_env("POLYMARKET_PRIVATE_KEY", ""),
             funder_address=_get_env("POLYMARKET_FUNDER_ADDRESS", ""),
