@@ -104,8 +104,8 @@ class Trainer:
     ) -> Optional[pd.DataFrame]:
         """Load and prepare training data from the database.
 
-        Loads candle data, computes features for each candle, and creates
-        labels (1 = UP, 0 = DOWN based on next candle close vs current close).
+        Loads candle data, computes features vectorized across all candles,
+        and creates labels (1 = UP, 0 = DOWN based on next candle close vs current close).
 
         Args:
             days: Number of days of data to load.
@@ -113,10 +113,10 @@ class Trainer:
         Returns:
             DataFrame with features and 'label' column, or None if insufficient data.
         """
-        limit = days * CANDLES_PER_DAY + FEATURE_LOOKBACK_CANDLES  # Extra for feature lookback
+        limit = days * CANDLES_PER_DAY + FEATURE_LOOKBACK_CANDLES
         candles = self.db.get_candles("candles_5m", limit=limit)
 
-        if len(candles) < CANDLES_PER_DAY * 3:  # Need at least 3 days
+        if len(candles) < CANDLES_PER_DAY * 3:
             logger.warning(
                 f"Insufficient candle data: {len(candles)} rows "
                 f"(need {CANDLES_PER_DAY * 3}+)."
@@ -132,216 +132,191 @@ class Trainer:
         df["label"] = (df["close"].shift(-1) > df["close"]).astype(int)
         df = df.iloc[:-1]  # Drop last row (no label)
 
-        # Compute features for each row using a sliding window approach
-        logger.info(f"Computing features for {len(df)} candles...")
-        feature_rows = []
-        feature_engine_local = FeatureEngine(self.db)
-
-        # We need sufficient history, so start from row 150+
-        start_idx = 150
+        start_idx = FEATURE_LOOKBACK_CANDLES  # 150
         if start_idx >= len(df):
             logger.warning("Not enough candles for feature computation.")
             return None
 
-        # Batch feature computation: compute features using candle slices
+        logger.info(f"Computing features (vectorized) for {len(df) - start_idx} candles...")
+
+        # --- 1. Candle features: compute ONCE on full DataFrame ---
+        from src.features.candle_features import compute_candle_features
+        candle_feats_series = compute_candle_features(df)
+        # Each value is a pd.Series aligned with df's index; take rows from start_idx onward
+        candle_df = pd.DataFrame({
+            k: v.iloc[start_idx:].reset_index(drop=True)
+            for k, v in candle_feats_series.items()
+        })
+
+        # --- 2. Time features: per-row (lightweight, no DB calls) ---
+        from src.features.time_features import compute_time_features
+        time_rows = []
         for i in range(start_idx, len(df)):
-            # Get candle slice up to this point
-            slice_df = df.iloc[max(0, i - 149): i + 1].copy()
-            try:
-                feats = self._compute_features_for_candle(
-                    slice_df, df.iloc[i]["timestamp"]
-                )
-                feats["label"] = df.iloc[i]["label"]
-                feats["_timestamp"] = df.iloc[i]["timestamp"]
-                feature_rows.append(feats)
-            except Exception as e:
-                # Skip candles where feature computation fails
-                continue
+            ts_ms = int(df.iloc[i]["timestamp"])
+            slice_df = df.iloc[max(0, i - 149): i + 1]
+            tf = compute_time_features(current_ts_ms=ts_ms, df_5m=slice_df)
+            time_rows.append(tf)
+        time_df = pd.DataFrame(time_rows).reset_index(drop=True)
 
-        if len(feature_rows) < CANDLES_PER_DAY:
-            logger.warning(
-                f"Too few valid feature rows: {len(feature_rows)} "
-                f"(need {CANDLES_PER_DAY}+)."
-            )
-            return None
+        # --- 3. Cross-TF features: vectorized (matching inference names) ---
+        cross_tf_df = self._vectorized_cross_tf(df, start_idx)
 
-        result = pd.DataFrame(feature_rows)
+        # --- 4. Combine candle + time + cross-TF features ---
+        combined_df = pd.concat([candle_df, time_df, cross_tf_df], axis=1)
+
+        # --- 5. Derived features: per-row (needs combined dict) ---
+        from src.features.derived_features import compute_derived_features
+        derived_rows = []
+        for i in range(len(combined_df)):
+            row_dict = combined_df.iloc[i].to_dict()
+            derived = compute_derived_features(features=row_dict, feature_history={})
+            derived_rows.append(derived)
+        derived_df = pd.DataFrame(derived_rows).reset_index(drop=True)
+
+        # Merge derived features
+        combined_df = pd.concat([combined_df, derived_df], axis=1)
+
+        # --- 6. Validate: replace NaN/inf with 0.0 ---
+        combined_df = combined_df.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+        combined_df = combined_df.replace([np.inf, -np.inf], 0.0)
+
+        # --- 7. Drop constant columns (all same value = no signal) ---
+        nunique = combined_df.nunique()
+        constant_cols = nunique[nunique <= 1].index.tolist()
+        if constant_cols:
+            logger.info(f"Dropping {len(constant_cols)} constant columns: {constant_cols[:10]}...")
+            combined_df = combined_df.drop(columns=constant_cols)
+
+        # --- 8. Add labels and timestamps ---
+        combined_df["label"] = df.iloc[start_idx:]["label"].reset_index(drop=True)
+        combined_df["_timestamp"] = df.iloc[start_idx:]["timestamp"].reset_index(drop=True)
+
         logger.info(
-            f"Training data prepared: {len(result)} samples, "
-            f"{len(result.columns) - 2} features"
+            f"Training data prepared: {len(combined_df)} samples, "
+            f"{len(combined_df.columns) - 2} features"
         )
-        return result
+        return combined_df
 
-    def _compute_features_for_candle(
-        self, candle_slice: pd.DataFrame, timestamp_ms: int
-    ) -> Dict[str, float]:
-        """Compute features for a single candle using its historical context.
+    def _vectorized_cross_tf(self, df: pd.DataFrame, start_idx: int) -> pd.DataFrame:
+        """Compute cross-timeframe features vectorized, matching inference feature names.
 
-        Uses a lightweight approach: computes candle-based features directly
-        from the slice without full DB access for orderbook/funding.
-        Falls back to zeros for orderbook/funding features during training.
+        Uses 5m data to approximate 15m/1h timeframe features. Feature names
+        and value ranges match compute_cross_tf_features() from cross_tf_features.py.
 
         Args:
-            candle_slice: DataFrame of candles ending at the target candle.
-            timestamp_ms: Timestamp of the target candle.
+            df: Full 5m candle DataFrame.
+            start_idx: Index from which to produce output rows.
 
         Returns:
-            Dict of feature_name -> value.
+            DataFrame with cross-TF features for rows [start_idx:].
         """
-        from src.features.candle_features import compute_candle_features
-        from src.features.time_features import compute_time_features
-        from src.features.derived_features import compute_derived_features
+        close = df["close"].values.astype(float)
+        high = df["high"].values.astype(float)
+        low = df["low"].values.astype(float)
+        opn = df["open"].values.astype(float)
+        n_out = len(df) - start_idx
 
-        # Candle features (main source of training signal)
-        candle_feats = compute_candle_features(candle_slice)
-        features = {k: float(v.iloc[-1]) for k, v in candle_feats.items()}
+        # Pre-allocate output arrays
+        tf15m_direction = np.zeros(n_out)
+        tf1h_direction = np.zeros(n_out)
+        tf_alignment_score = np.zeros(n_out)
+        tf15m_rsi = np.full(n_out, 50.0)
+        tf1h_rsi = np.full(n_out, 50.0)
+        tf_vol_ratio = np.ones(n_out)
+        tf15m_trend_strength = np.zeros(n_out)
+        tf1h_trend_strength = np.zeros(n_out)
+        tf1h_sr_proximity = np.full(n_out, 0.5)
+        tf_momentum_alignment = np.zeros(n_out)
 
-        # Time features
-        time_feats = compute_time_features(
-            current_ts_ms=int(timestamp_ms), df_5m=candle_slice
-        )
-        features.update(time_feats)
+        for out_i, i in enumerate(range(start_idx, len(df))):
+            # 1. 15m direction: approximate from 3-candle window (=15min)
+            if i >= 2:
+                # Use open of 3 candles ago vs close of current as proxy for 15m candle
+                open_15m = opn[i - 2]
+                close_15m = close[i]
+                tf15m_direction[out_i] = 1.0 if close_15m > open_15m else -1.0
+            
+            # 2. 1h direction: approximate from 12-candle window (=1h)
+            if i >= 11:
+                open_1h = opn[i - 11]
+                close_1h = close[i]
+                tf1h_direction[out_i] = 1.0 if close_1h > open_1h else -1.0
 
-        # Cross-timeframe features (simplified: use 5m data only)
-        # Full cross-TF features need 15m/1h data which is complex to slice
-        # during batch training. We use simplified proxies.
-        features.update(self._simplified_cross_tf(candle_slice))
+            # 3. Alignment: does 5m direction match 15m and 1h?
+            dir_5m = 1.0 if close[i] > opn[i] else -1.0
+            alignment = 0
+            if tf15m_direction[out_i] == dir_5m:
+                alignment += 1
+            if tf1h_direction[out_i] == dir_5m:
+                alignment += 1
+            tf_alignment_score[out_i] = float(alignment)
 
-        # Orderbook features default to 0.0 during historical training
-        # (orderbook data is not available for historical candles in most cases)
-        ob_names = [
-            "ob_imbalance_5", "ob_imbalance_10", "ob_imbalance_20",
-            "ob_imbalance_change_30s", "ob_imbalance_change_60s",
-            "ob_imbalance_change_90s", "ob_slope_bid", "ob_slope_ask",
-            "ob_slope_ratio", "ob_wall_bid", "ob_wall_ask", "ob_wall_imbalance",
-            "ob_spread_bps", "ob_spread_vs_avg", "ob_spread_percentile",
-            "ob_net_pressure", "ob_pressure_change_30s", "ob_pressure_change_60s",
-            "ob_pressure_change_90s", "ob_pressure_momentum",
-        ]
-        for name in ob_names:
-            if name not in features:
-                features[name] = 0.0
+            # 4. 15m RSI (EWM approximation using 15 5m candles)
+            if i >= 14:
+                rets = np.diff(close[i - 14: i + 1])
+                gains = rets[rets > 0]
+                losses = -rets[rets < 0]
+                avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
+                avg_loss = np.mean(losses) if len(losses) > 0 else 1e-8
+                rs = avg_gain / max(avg_loss, 1e-8)
+                tf15m_rsi[out_i] = 100.0 - (100.0 / (1.0 + rs))
 
-        # Funding features default to 0.0
-        funding_names = [
-            "funding_rate", "funding_momentum", "funding_time_to_settlement",
-            "funding_vs_24h_avg", "funding_vs_7d_avg", "funding_percentile_7d",
-            "funding_direction", "funding_acceleration",
-        ]
-        for name in funding_names:
-            if name not in features:
-                features[name] = 0.0
+            # 5. 1h RSI (EWM approximation using 60 5m candles)
+            if i >= 59:
+                rets = np.diff(close[i - 59: i + 1])
+                gains = rets[rets > 0]
+                losses = -rets[rets < 0]
+                avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
+                avg_loss = np.mean(losses) if len(losses) > 0 else 1e-8
+                rs = avg_gain / max(avg_loss, 1e-8)
+                tf1h_rsi[out_i] = 100.0 - (100.0 / (1.0 + rs))
 
-        # Polymarket features default to 0.0
-        pm_names = [
-            "pm_up_odds", "pm_down_odds", "pm_odds_velocity",
-            "pm_volume_ratio", "pm_total_volume", "pm_odds_divergence",
-        ]
-        for name in pm_names:
-            if name not in features:
-                features[name] = 0.0
+            # 6. Volatility ratio: 5m ATR / 1h ATR approximation
+            if i >= 11:
+                atr_5m = np.mean(np.abs(np.diff(close[max(0, i - 5): i + 1])))
+                atr_1h = np.mean(np.abs(np.diff(close[max(0, i - 11): i + 1])))
+                tf_vol_ratio[out_i] = atr_5m / max(atr_1h, 1e-8)
 
-        # Derived features
-        derived_feats = compute_derived_features(
-            features=features, feature_history={}
-        )
-        features.update(derived_feats)
+            # 7. 15m trend strength (EMA proxy: slope over 3 candles / mean price)
+            if i >= 2:
+                window = close[i - 2: i + 1]
+                x = np.arange(3)
+                coeffs = np.polyfit(x, window, 1)
+                tf15m_trend_strength[out_i] = coeffs[0] / max(np.mean(window), 1e-8)
 
-        # Validate: replace NaN/inf with 0.0
-        cleaned = {}
-        for k, v in features.items():
-            try:
-                fv = float(v)
-                if not np.isfinite(fv):
-                    fv = 0.0
-            except (TypeError, ValueError):
-                fv = 0.0
-            cleaned[k] = fv
+            # 8. 1h trend strength (slope over 12 candles / mean price)
+            if i >= 11:
+                window = close[i - 11: i + 1]
+                x = np.arange(12)
+                coeffs = np.polyfit(x, window, 1)
+                tf1h_trend_strength[out_i] = coeffs[0] / max(np.mean(window), 1e-8)
 
-        return cleaned
+            # 9. S/R proximity (position between 1h swing high/low)
+            if i >= 11:
+                recent_high = np.max(high[i - 11: i + 1])
+                recent_low = np.min(low[i - 11: i + 1])
+                price_range = recent_high - recent_low
+                if price_range > 0:
+                    tf1h_sr_proximity[out_i] = (close[i] - recent_low) / price_range
 
-    def _simplified_cross_tf(self, df_5m: pd.DataFrame) -> Dict[str, float]:
-        """Compute simplified cross-timeframe features from 5m data only."""
-        features = {}
-        close = df_5m["close"].values.astype(float)
+            # 10. Momentum alignment: +1 all up, -1 all down, 0 mixed
+            dirs = [dir_5m, tf15m_direction[out_i], tf1h_direction[out_i]]
+            nonzero = [d for d in dirs if d != 0]
+            if len(nonzero) == 3 and len(set(nonzero)) == 1:
+                tf_momentum_alignment[out_i] = nonzero[0]
 
-        # Simulate 15m direction from last 3 candles
-        if len(close) >= 3:
-            features["cross_15m_direction"] = 1.0 if close[-1] > close[-3] else 0.0
-        else:
-            features["cross_15m_direction"] = 0.5
-
-        # Simulate 1h direction from last 12 candles
-        if len(close) >= 12:
-            features["cross_1h_direction"] = 1.0 if close[-1] > close[-12] else 0.0
-        else:
-            features["cross_1h_direction"] = 0.5
-
-        # Alignment
-        d5m = 1.0 if len(close) >= 2 and close[-1] > close[-2] else 0.0
-        features["cross_alignment"] = (
-            d5m + features["cross_15m_direction"] + features["cross_1h_direction"]
-        )
-
-        # Simplified RSI for longer timeframes
-        if len(close) >= 15:
-            returns = np.diff(close[-15:])
-            gains = returns[returns > 0]
-            losses = -returns[returns < 0]
-            avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
-            avg_loss = np.mean(losses) if len(losses) > 0 else 1e-8
-            rs = avg_gain / max(avg_loss, 1e-8)
-            features["cross_15m_rsi"] = 100.0 - (100.0 / (1.0 + rs))
-        else:
-            features["cross_15m_rsi"] = 50.0
-
-        if len(close) >= 60:
-            returns = np.diff(close[-60:])
-            gains = returns[returns > 0]
-            losses = -returns[returns < 0]
-            avg_gain = np.mean(gains) if len(gains) > 0 else 0.0
-            avg_loss = np.mean(losses) if len(losses) > 0 else 1e-8
-            rs = avg_gain / max(avg_loss, 1e-8)
-            features["cross_1h_rsi"] = 100.0 - (100.0 / (1.0 + rs))
-        else:
-            features["cross_1h_rsi"] = 50.0
-
-        # Volatility ratio
-        if len(close) >= 12:
-            atr_5m = np.mean(np.abs(np.diff(close[-6:])))
-            atr_1h = np.mean(np.abs(np.diff(close[-12:])))
-            features["cross_vol_ratio"] = atr_5m / max(atr_1h, 1e-8)
-        else:
-            features["cross_vol_ratio"] = 1.0
-
-        # Trend strength proxies
-        for prefix, lookback in [("cross_15m_trend", 3), ("cross_1h_trend", 12)]:
-            if len(close) >= lookback:
-                x = np.arange(lookback)
-                c = close[-lookback:]
-                coeffs = np.polyfit(x, c, 1)
-                features[prefix] = coeffs[0] / max(np.mean(c), 1e-8)
-            else:
-                features[prefix] = 0.0
-
-        # S/R proximity (distance to recent high/low)
-        if len(close) >= 12:
-            recent_high = np.max(df_5m["high"].values[-12:])
-            recent_low = np.min(df_5m["low"].values[-12:])
-            price_range = recent_high - recent_low
-            if price_range > 0:
-                features["cross_sr_proximity"] = (
-                    (close[-1] - recent_low) / price_range
-                )
-            else:
-                features["cross_sr_proximity"] = 0.5
-        else:
-            features["cross_sr_proximity"] = 0.5
-
-        # Momentum alignment
-        features["cross_momentum_alignment"] = features["cross_alignment"] / 3.0
-
-        return features
+        return pd.DataFrame({
+            "tf15m_direction": tf15m_direction,
+            "tf1h_direction": tf1h_direction,
+            "tf_alignment_score": tf_alignment_score,
+            "tf15m_rsi": tf15m_rsi,
+            "tf1h_rsi": tf1h_rsi,
+            "tf_vol_ratio": tf_vol_ratio,
+            "tf15m_trend_strength": tf15m_trend_strength,
+            "tf1h_trend_strength": tf1h_trend_strength,
+            "tf1h_sr_proximity": tf1h_sr_proximity,
+            "tf_momentum_alignment": tf_momentum_alignment,
+        })
 
     # ================================================================== #
     # WALK-FORWARD CROSS-VALIDATION
@@ -1095,8 +1070,8 @@ class Trainer:
         min_count = class_counts.min()
         max_count = class_counts.max()
 
-        # Only apply SMOTE if imbalance is significant (>60/40)
-        if min_count / max_count > 0.6:
+        # Only apply SMOTE if imbalance is significant (>55/45)
+        if min_count / max_count > 0.55:
             return X, y
 
         try:
