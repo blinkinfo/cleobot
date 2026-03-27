@@ -1,28 +1,33 @@
-"""CleoBot main entry point.
+"""CleoBot main entry point -- Phase 7: Full production orchestrator.
 
-Implements the startup sequence from Section 6:
+Startup sequence (Section 6):
 1. Load environment variables
-2. Initialize SQLite database (create tables if not exist)
+2. Initialize SQLite database
 3. Connect to MEXC WebSocket streams
-4. Backfill candle history (REST API) if database has gaps
-5. Load latest trained models from disk (or trigger initial training if none exist)
+4. Backfill candle history if database has gaps
+5. Load latest trained models (or trigger initial training)
 6. Initialize Telegram bot
-7. Initialize APScheduler with 5-minute cycle jobs
-8. Send startup notification to Telegram
+7. Initialize APScheduler with all jobs
+8. Send startup notification
 9. Enter main loop
 
 Also handles:
 - Graceful shutdown (SIGTERM from Railway)
-- Restart recovery (detect last processed candle, resume from next slot)
+- Restart recovery (detect last processed candle, resume)
+- Signal-only mode (no auto-trading, just signals to Telegram)
+- Health check HTTP endpoint on port 8080
 """
 
 import asyncio
 import signal
 import sys
 import os
+import json
+import time
 from datetime import datetime, timezone
+from typing import Optional
 
-# Add project root to path for imports
+# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import load_config, Config
@@ -31,166 +36,467 @@ from src.data.mexc_ws import MEXCWebSocketClient
 from src.data.mexc_rest import MEXCRestClient
 from src.data.collector import DataCollector
 from src.data.backfill import DataBackfill
+from src.features.engine import FeatureEngine
+from src.models.ensemble import Ensemble
+from src.trading.polymarket import PolymarketClient
+from src.trading.executor import build_executor
+from src.telegram_bot.bot import CleoBotTelegram
 from src.utils.logger import setup_logger, get_logger
 from src.utils.scheduler import (
     create_scheduler,
     add_trading_cycle_job,
     add_settlement_check_job,
     add_funding_rate_job,
+    add_retrain_job,
+    add_incremental_update_job,
+    add_daily_summary_job,
 )
 
 logger = get_logger("main")
 
+HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
+LOG_PATH = os.getenv("LOG_PATH", "/data/cleobot.log")
+
+
+# ------------------------------------------------------------------ #
+# Health Check HTTP Server
+# ------------------------------------------------------------------ #
+
+async def start_health_server(app: "CleoBot") -> None:
+    """Start a lightweight HTTP health check server on HEALTH_PORT."""
+    try:
+        from aiohttp import web
+
+        async def health_handler(request):
+            uptime = time.time() - app._start_ts
+            status = {
+                "status": "ok" if app._is_running else "starting",
+                "uptime_s": round(uptime, 1),
+                "auto_trade": app.auto_trade_enabled,
+                "candles_5m": app.db.get_candle_count("candles_5m") if app.db else 0,
+                "models_ready": app.ensemble.is_ready if app.ensemble else False,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+            return web.Response(
+                text=json.dumps(status),
+                content_type="application/json",
+            )
+
+        async def ready_handler(request):
+            return web.Response(text="OK")
+
+        server_app = web.Application()
+        server_app.router.add_get("/health", health_handler)
+        server_app.router.add_get("/ready", ready_handler)
+        server_app.router.add_get("/", ready_handler)
+
+        runner = web.AppRunner(server_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+        await site.start()
+        logger.info(f"Health check server running on port {HEALTH_PORT}")
+    except ImportError:
+        logger.warning("aiohttp not available -- health check server disabled.")
+    except Exception as e:
+        logger.warning(f"Health check server failed to start: {e}")
+
+
+# ------------------------------------------------------------------ #
+# CleoBot Application
+# ------------------------------------------------------------------ #
 
 class CleoBot:
-    """Main CleoBot application.
-    
-    Orchestrates all components: data collection, feature engineering,
-    ML models, signal generation, trading, and Telegram bot.
+    """Main CleoBot application orchestrator.
+
+    Wires all components: data collection, feature engineering,
+    ML models, signal generation, trading execution, and Telegram bot.
+
+    Attributes exposed to Telegram handlers via bot_data["cleobot"]:
+        - executor:       TradingExecutor
+        - db:             Database
+        - ensemble:       Ensemble
+        - feature_engine: FeatureEngine
+        - auto_trade_enabled: bool
+        - config:         Config
     """
 
     def __init__(self):
-        """Initialize CleoBot (components created in start())."""
-        self.config: Config = None
-        self.db: Database = None
-        self.ws_client: MEXCWebSocketClient = None
-        self.rest_client: MEXCRestClient = None
-        self.collector: DataCollector = None
-        self.backfill: DataBackfill = None
+        self.config: Optional[Config] = None
+        self.db: Optional[Database] = None
+        self.ws_client: Optional[MEXCWebSocketClient] = None
+        self.rest_client: Optional[MEXCRestClient] = None
+        self.collector: Optional[DataCollector] = None
+        self.backfill: Optional[DataBackfill] = None
+        self.feature_engine: Optional[FeatureEngine] = None
+        self.ensemble: Optional[Ensemble] = None
+        self.polymarket: Optional[PolymarketClient] = None
+        self.executor = None
+        self.telegram: Optional[CleoBotTelegram] = None
         self.scheduler = None
+
         self._shutdown_event = asyncio.Event()
         self._is_running = False
+        self._start_ts = time.time()
+        self._cycle_count = 0
+        self._last_candle_ts: Optional[int] = None
+
+    @property
+    def auto_trade_enabled(self) -> bool:
+        if self.executor:
+            return getattr(self.executor, "_auto_trade_enabled",
+                           self.config.trading.auto_trade_enabled if self.config else False)
+        return self.config.trading.auto_trade_enabled if self.config else False
+
+    # ---------------------------------------------------------------- #
+    # STARTUP
+    # ---------------------------------------------------------------- #
 
     async def start(self):
-        """Execute the full startup sequence."""
+        """Execute the full 9-step startup sequence."""
         try:
-            # Step 1: Load environment variables
-            logger.info("=" * 60)
-            logger.info("  CleoBot Starting Up")
-            logger.info("=" * 60)
-            
-            self.config = load_config()
-            root_logger = setup_logger("cleobot", self.config.system.log_level)
-            logger.info(f"Step 1/9: Configuration loaded (log_level={self.config.system.log_level})")
-            logger.info(f"  Data directory: {self.config.system.data_dir}")
-            logger.info(f"  MEXC configured: {self.config.mexc.is_configured}")
-            logger.info(f"  Telegram configured: {self.config.telegram.is_configured}")
-            logger.info(f"  Polymarket configured: {self.config.polymarket.is_configured}")
-            logger.info(f"  Auto-trade enabled: {self.config.trading.auto_trade_enabled}")
-
-            # Step 2: Initialize SQLite database
-            self.db = Database(self.config.system.db_path)
-            logger.info(f"Step 2/9: Database initialized at {self.config.system.db_path}")
-            db_stats = self.db.get_db_stats()
-            for table, count in db_stats.items():
-                if count > 0:
-                    logger.info(f"  {table}: {count} records")
-
-            # Step 3: Connect to MEXC WebSocket streams
-            self.ws_client = MEXCWebSocketClient(symbol=self.config.mexc.symbol)
-            self.rest_client = MEXCRestClient(
-                symbol=self.config.mexc.symbol,
-                api_key=self.config.mexc.api_key,
-                secret_key=self.config.mexc.secret_key,
-            )
-            self.collector = DataCollector(self.db, self.ws_client, self.rest_client)
-            await self.collector.start()
-            logger.info("Step 3/9: MEXC data collection started (WebSocket + REST)")
-
-            # Step 4: Backfill candle history if database has gaps
-            self.backfill = DataBackfill(self.db, self.rest_client)
-            logger.info("Step 4/9: Checking data and running backfill if needed...")
-            health_before = await self.backfill.check_data_health()
-            for interval, info in health_before.items():
-                logger.info(
-                    f"  {interval}: {info['count']} candles, "
-                    f"sufficient={info['sufficient']}"
-                )
-
-            # Run backfill for intervals that need it
-            needs_backfill = any(
-                not info["sufficient"] for info in health_before.values()
-            )
-            if needs_backfill:
-                logger.info("  Running backfill...")
-                backfill_results = await self.backfill.run_backfill()
-                for interval, result in backfill_results.items():
-                    logger.info(f"  {interval} backfill: {result}")
-            else:
-                logger.info("  All candle data is sufficient. No backfill needed.")
-
-            # Step 5: Load latest trained models (Phase 3 -- placeholder for now)
-            logger.info("Step 5/9: Model loading (will be implemented in Phase 3)")
-            # Models will be loaded here once Phase 3 is complete.
-            # For now, the bot runs in signal-collection mode.
-
-            # Step 6: Initialize Telegram bot (Phase 5 -- placeholder for now)
-            logger.info("Step 6/9: Telegram bot initialization (will be implemented in Phase 5)")
-            # Telegram bot will be initialized here once Phase 5 is complete.
-
-            # Step 7: Initialize APScheduler with cycle jobs
-            self.scheduler = create_scheduler()
-
-            # Add trading cycle job (runs at :02, :07, :12, etc.)
-            add_trading_cycle_job(self.scheduler, self._trading_cycle)
-
-            # Add settlement check job (runs at :00, :05, :10, etc.)
-            add_settlement_check_job(self.scheduler, self._settlement_check)
-
-            # Add funding rate polling (every 60 seconds)
-            add_funding_rate_job(self.scheduler, self.collector.fetch_funding_rate)
-
-            self.scheduler.start()
-            logger.info("Step 7/9: APScheduler started with trading cycle and funding rate jobs")
-
-            # Step 8: Send startup notification (Telegram placeholder)
-            startup_msg = (
-                f"CleoBot started at "
-                f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                f"Mode: {'AUTO-TRADE' if self.config.trading.auto_trade_enabled else 'SIGNALS ONLY'}\n"
-                f"Data: {self.db.get_candle_count('candles_5m')} 5m candles loaded"
-            )
-            logger.info(f"Step 8/9: Startup notification: {startup_msg}")
-            # Will send via Telegram once Phase 5 is complete.
-
-            # Step 9: Enter main loop
+            await self._startup()
             self._is_running = True
-            logger.info("Step 9/9: Entering main loop. CleoBot is running!")
-            logger.info("=" * 60)
-
-            # Keep running until shutdown signal
             await self._shutdown_event.wait()
-
         except Exception as e:
             logger.error(f"Fatal error during startup: {e}", exc_info=True)
             raise
         finally:
             await self.shutdown()
 
-    async def shutdown(self):
-        """Graceful shutdown sequence.
-        
-        On shutdown signal (SIGTERM from Railway):
-        - Close WebSocket connections
-        - Flush pending DB writes
-        - Stop scheduler
-        - Send Telegram notification
+    async def _startup(self):
+        logger.info("=" * 60)
+        logger.info("  CleoBot Starting Up")
+        logger.info("=" * 60)
+
+        # Step 1: Load configuration
+        self.config = load_config()
+        setup_logger("cleobot", self.config.system.log_level)
+        logger.info(
+            f"Step 1/9: Config loaded | "
+            f"auto_trade={self.config.trading.auto_trade_enabled} | "
+            f"data_dir={self.config.system.data_dir}"
+        )
+
+        # Step 2: Database
+        self.db = Database(self.config.system.db_path)
+        db_stats = self.db.get_db_stats()
+        n_5m = db_stats.get("candles_5m", 0)
+        n_trades = db_stats.get("trades", 0)
+        logger.info(f"Step 2/9: Database ready | 5m={n_5m} candles | trades={n_trades}")
+
+        # Start health check server early so Railway doesn't kill us
+        asyncio.ensure_future(start_health_server(self))
+
+        # Step 3: MEXC data collection
+        self.ws_client = MEXCWebSocketClient(symbol=self.config.mexc.symbol)
+        self.rest_client = MEXCRestClient(
+            symbol=self.config.mexc.symbol,
+            api_key=self.config.mexc.api_key,
+            secret_key=self.config.mexc.secret_key,
+        )
+        self.collector = DataCollector(self.db, self.ws_client, self.rest_client)
+        await self.collector.start()
+        logger.info("Step 3/9: MEXC data collection started")
+
+        # Step 4: Backfill
+        self.backfill = DataBackfill(self.db, self.rest_client)
+        health = await self.backfill.check_data_health()
+        needs_backfill = any(not info.get("sufficient") for info in health.values())
+        if needs_backfill:
+            logger.info("Step 4/9: Running data backfill...")
+            results = await self.backfill.run_backfill()
+            for interval, result in results.items():
+                logger.info(f"  {interval}: {result}")
+        else:
+            logger.info(f"Step 4/9: Data sufficient ({n_5m} 5m candles) -- no backfill needed")
+
+        # Restart recovery: track last processed candle
+        self._last_candle_ts = self.db.get_latest_candle_timestamp("candles_5m")
+        if self._last_candle_ts:
+            logger.info(
+                f"  Restart recovery: last 5m candle at "
+                f"{datetime.fromtimestamp(self._last_candle_ts / 1000, tz=timezone.utc)}"
+            )
+
+        # Step 5: Load models
+        self.feature_engine = FeatureEngine(self.db)
+        self.ensemble = Ensemble(
+            models_dir=self.config.system.models_dir,
+            db=self.db,
+        )
+        self.ensemble.load_models()
+
+        if not self.ensemble.is_ready:
+            logger.info("Step 5/9: No trained models found -- running initial training...")
+            await self._run_initial_training()
+        else:
+            logger.info("Step 5/9: Models loaded successfully")
+
+        # Step 6: Polymarket client
+        self.polymarket = PolymarketClient(self.config.polymarket)
+        logger.info(
+            f"Step 6/9: Polymarket client initialised "
+            f"(configured={self.config.polymarket.is_configured})"
+        )
+
+        # Step 7: Build executor
+        self.telegram = CleoBotTelegram(self.config.telegram)
+        self.executor = build_executor(
+            config=self.config,
+            db=self.db,
+            feature_engine=self.feature_engine,
+            ensemble=self.ensemble,
+            polymarket_client=self.polymarket,
+            telegram_bot=self.telegram,
+        )
+        # Wire auto_trade flag from config
+        self.executor._auto_trade_enabled = self.config.trading.auto_trade_enabled
+
+        # Step 8: Telegram bot
+        await self.telegram.start(
+            cleobot_app=self,
+            db_path=self.config.system.db_path,
+            log_path=LOG_PATH,
+        )
+        logger.info(
+            f"Step 8/9: Telegram bot started "
+            f"(configured={self.config.telegram.is_configured})"
+        )
+
+        # Step 9: APScheduler
+        self.scheduler = create_scheduler()
+        add_trading_cycle_job(self.scheduler, self._trading_cycle)
+        add_settlement_check_job(self.scheduler, self._settlement_check)
+        add_funding_rate_job(self.scheduler, self.collector.fetch_funding_rate)
+        add_retrain_job(
+            self.scheduler,
+            self._full_retrain,
+            hour_utc=self.config.system.retrain_hour_utc,
+        )
+        add_incremental_update_job(self.scheduler, self._incremental_update)
+        add_daily_summary_job(self.scheduler, self._daily_summary)
+        self.scheduler.start()
+        logger.info("Step 9/9: APScheduler started with all 6 jobs")
+
+        # Send startup notification
+        mode = "AUTO-TRADE" if self.config.trading.auto_trade_enabled else "SIGNALS ONLY"
+        startup_msg = (
+            f"\U0001F916 CleoBot Online\n"
+            f"Mode: {mode}\n"
+            f"5m candles: {self.db.get_candle_count('candles_5m')}\n"
+            f"Models ready: {self.ensemble.is_ready}\n"
+            f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+        await self.telegram.send_message(startup_msg)
+        logger.info("=" * 60)
+        logger.info("  CleoBot is RUNNING")
+        logger.info("=" * 60)
+
+    # ---------------------------------------------------------------- #
+    # TRADING CYCLE
+    # ---------------------------------------------------------------- #
+
+    async def _trading_cycle(self):
+        """Execute one full 5-minute trading cycle.
+
+        Called at :02, :07, :12, ... of every 5-minute slot.
+        Delegates to TradingExecutor which handles features -> signal -> filters -> trade.
         """
-        if not self._is_running:
+        if not self.executor:
+            logger.warning("Trading cycle called before executor is ready -- skipping.")
             return
+
+        self._cycle_count += 1
+        now = datetime.now(timezone.utc)
+        candle_ts_ms = int(now.timestamp() * 1000)
+
+        try:
+            # Get latest orderbook snapshot for the executor
+            current_orderbook = self.collector.get_latest_orderbook() if self.collector else None
+
+            # Honour signal-only mode: override auto-trade flag
+            if not self.config.trading.auto_trade_enabled:
+                if hasattr(self.executor, "_auto_trade_enabled"):
+                    self.executor._auto_trade_enabled = False
+
+            result = await self.executor.run_cycle(
+                candle_ts_ms=candle_ts_ms,
+                current_orderbook=current_orderbook,
+            )
+
+            # Cache latest signal for Telegram handlers
+            if result.signal and self.telegram:
+                self.telegram.cache_signal(result.signal.to_dict())
+
+            logger.debug(
+                f"Cycle #{self._cycle_count} done | "
+                f"trade={result.trade_placed} | "
+                f"dur={result.duration_s:.2f}s"
+            )
+
+        except Exception as e:
+            logger.error(f"Trading cycle #{self._cycle_count} error: {e}", exc_info=True)
+            if self.telegram:
+                await self.telegram.send_message(f"\u26A0\uFE0F Cycle error: {e}")
+
+    async def _settlement_check(self):
+        """Check and settle pending trades.
+
+        Called at :00:05, :05:05, :10:05, ... (5s after candle close).
+        The executor's _settle_pending_trades handles the actual logic.
+        """
+        if not self.executor:
+            return
+        try:
+            now = datetime.now(timezone.utc)
+            await self.executor._settle_pending_trades(now)
+        except Exception as e:
+            logger.error(f"Settlement check error: {e}", exc_info=True)
+
+    # ---------------------------------------------------------------- #
+    # RETRAINING
+    # ---------------------------------------------------------------- #
+
+    async def _run_initial_training(self):
+        """Run initial model training when no models exist."""
+        try:
+            from src.models.trainer import ModelTrainer
+            import pandas as pd
+
+            logger.info("Running initial model training...")
+            candles = self.db.get_candles("candles_5m", limit=5000)
+            if len(candles) < 200:
+                logger.warning(
+                    f"Only {len(candles)} candles available for initial training. "
+                    "Need 200+. Training deferred."
+                )
+                return
+
+            df_5m = pd.DataFrame(candles)
+            trainer = ModelTrainer(
+                db=self.db,
+                models_dir=self.config.system.models_dir,
+            )
+            results = trainer.initial_training(df_5m=df_5m)
+            self.ensemble.load_models()
+            logger.info(f"Initial training complete: {results}")
+            if self.telegram:
+                await self.telegram.send_message(
+                    f"\u2705 Initial training complete\n"
+                    f"Models: {list(results.keys()) if isinstance(results, dict) else 'done'}"
+                )
+        except ImportError:
+            logger.warning("ModelTrainer not available -- skipping initial training.")
+        except Exception as e:
+            logger.error(f"Initial training failed: {e}", exc_info=True)
+
+    async def _full_retrain(self):
+        """Run daily full model retrain (04:00 UTC)."""
+        if not self.executor:
+            return
+        try:
+            logger.info("=== Scheduled daily retrain starting ===")
+            if self.telegram:
+                await self.telegram.send_message("\U0001F504 Daily retrain starting...")
+            await self.executor._run_full_retrain()
+            ts = datetime.now(timezone.utc).isoformat()
+            if self.telegram:
+                self.telegram.record_retrain_ts(ts)
+        except Exception as e:
+            logger.error(f"Full retrain scheduler error: {e}", exc_info=True)
+
+    async def _incremental_update(self):
+        """Run 6-hourly incremental model update."""
+        if not self.executor:
+            return
+        try:
+            await self.executor._run_incremental_update()
+        except Exception as e:
+            logger.error(f"Incremental update error: {e}", exc_info=True)
+
+    # ---------------------------------------------------------------- #
+    # DAILY SUMMARY
+    # ---------------------------------------------------------------- #
+
+    async def _daily_summary(self):
+        """Send daily summary at 00:00:30 UTC."""
+        if not self.telegram:
+            return
+        try:
+            stats = self.db.get_trade_stats_today()
+            total = stats.get("settled", 0)
+            wins = stats.get("wins", 0)
+            losses = stats.get("losses", 0)
+            pnl = stats.get("pnl", 0.0)
+            accuracy = stats.get("accuracy", 0.0)
+
+            # Save session stats
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            self.db.update_session_stats(
+                date=today,
+                trades_count=stats.get("total_trades", 0),
+                wins=wins,
+                losses=losses,
+                skips=0,
+                pnl=pnl,
+                accuracy=accuracy,
+            )
+
+            # Cleanup old data
+            self.db.cleanup_old_data(candle_days=30, orderbook_days=7)
+
+            icon = "\U0001F4CA"
+            msg = (
+                f"{icon} Daily Summary -- {today}\n"
+                f"Trades: {total} | W{wins}/L{losses}\n"
+                f"Accuracy: {accuracy:.1%}\n"
+                f"P&L: ${pnl:+.2f}\n"
+            )
+            if self.executor:
+                risk_stats = self.executor.risk_manager.get_daily_stats_summary()
+                msg += f"Daily PnL: ${risk_stats.get('daily_pnl', 0):+.2f}\n"
+
+            await self.telegram.send_message(msg)
+            logger.info(f"Daily summary sent: {total} trades, {accuracy:.1%} accuracy, ${pnl:+.2f} P&L")
+        except Exception as e:
+            logger.error(f"Daily summary error: {e}", exc_info=True)
+
+    # ---------------------------------------------------------------- #
+    # SHUTDOWN
+    # ---------------------------------------------------------------- #
+
+    async def shutdown(self):
+        """Graceful shutdown sequence."""
+        if not self._is_running and self._cycle_count == 0:
+            # Called before fully started
+            logger.info("Shutdown called before fully started -- cleaning up.")
 
         logger.info("=" * 60)
         logger.info("  CleoBot Shutting Down")
         logger.info("=" * 60)
-
         self._is_running = False
 
-        # Stop scheduler first
+        # Stop scheduler (no new jobs fire)
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
             logger.info("Scheduler stopped.")
 
-        # Stop data collection (closes WebSocket and REST)
+        # Send shutdown notification
+        if self.telegram:
+            try:
+                uptime_s = time.time() - self._start_ts
+                h, m = divmod(int(uptime_s // 60), 60)
+                await self.telegram.send_message(
+                    f"\U0001F6D1 CleoBot shutting down\n"
+                    f"Uptime: {h}h {m}m\n"
+                    f"Cycles: {self._cycle_count}"
+                )
+            except Exception:
+                pass
+            await self.telegram.stop()
+            logger.info("Telegram bot stopped.")
+
+        # Stop data collection
         if self.collector:
             await self.collector.stop()
             logger.info("Data collector stopped.")
@@ -200,67 +506,29 @@ class CleoBot:
             self.db.close()
             logger.info("Database closed.")
 
-        # Send shutdown notification (Telegram placeholder)
-        logger.info(
-            f"CleoBot shut down at "
-            f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        )
         logger.info("Shutdown complete.")
 
-    async def _trading_cycle(self):
-        """Execute one trading cycle.
-        
-        Called every 5 minutes at :02 of each slot.
-        Full implementation comes in Phase 4 (filters, execution).
-        For now, logs the cycle trigger.
-        """
-        now = datetime.now(timezone.utc)
-        logger.info(
-            f"Trading cycle triggered at {now.strftime('%H:%M:%S')} UTC. "
-            f"(Full pipeline coming in Phase 4)"
-        )
-
-        # Log current data status
-        stats = self.collector.get_stats()
-        logger.debug(
-            f"Data status: 5m={stats['candles_5m_received']}, "
-            f"15m={stats['candles_15m_received']}, "
-            f"1h={stats['candles_1h_received']}, "
-            f"ob_saved={stats['orderbook_snapshots_saved']}, "
-            f"price={stats['latest_price']:.2f}"
-        )
-
-    async def _settlement_check(self):
-        """Check settlement for pending trades.
-        
-        Called every 5 minutes at :00 of each slot.
-        Full implementation comes in Phase 4.
-        """
-        # Check for unsettled trades
-        unsettled = self.db.get_unsettled_trades()
-        if unsettled:
-            logger.debug(f"Settlement check: {len(unsettled)} unsettled trades pending.")
-
     def _handle_signal(self, sig):
-        """Handle OS signals for graceful shutdown."""
-        logger.info(f"Received signal {sig.name}. Initiating shutdown...")
+        """Handle OS signal for graceful shutdown."""
+        logger.info(f"Received {sig.name} -- initiating shutdown...")
         self._shutdown_event.set()
 
 
+# ------------------------------------------------------------------ #
+# ENTRY POINT
+# ------------------------------------------------------------------ #
+
 def main():
     """Main entry point for CleoBot."""
-    # Set up event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     bot = CleoBot()
 
-    # Register signal handlers for graceful shutdown
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, bot._handle_signal, sig)
-        except NotImplementedError:
-            # Windows doesn't support add_signal_handler
+        except (NotImplementedError, RuntimeError):
             signal.signal(sig, lambda s, f: bot._handle_signal(signal.Signals(s)))
 
     try:
@@ -269,11 +537,10 @@ def main():
         logger.info("Keyboard interrupt received.")
     except Exception as e:
         logger.error(f"Unhandled exception: {e}", exc_info=True)
+        sys.exit(1)
     finally:
-        # Ensure cleanup
-        if bot._is_running:
-            loop.run_until_complete(bot.shutdown())
-        loop.close()
+        if not loop.is_closed():
+            loop.close()
 
 
 if __name__ == "__main__":
