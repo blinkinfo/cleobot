@@ -26,7 +26,8 @@ from sklearn.model_selection import TimeSeriesSplit
 from imblearn.over_sampling import SMOTE
 
 from src.database import Database
-from src.features.engine import FeatureEngine
+from src.features.engine import FeatureEngine, FUNDING_LOOKBACK
+from src.features.funding_features import compute_funding_features
 from src.models.lgbm_model import LightGBMModel
 from src.models.tcn_model import TCNModel
 from src.models.logreg_model import LogRegModel
@@ -139,6 +140,25 @@ class Trainer:
 
         logger.info(f"Computing features (vectorized) for {len(df) - start_idx} candles...")
 
+        # --- 0. Pre-load ALL funding rate records for the training window ---
+        # Load once to avoid per-row DB queries. We use the candle timestamp
+        # range to fetch only relevant records via the `since` parameter.
+        earliest_candle_ts = int(df.iloc[0]["timestamp"])
+        all_funding_records = self.db.get_funding_rates(
+            limit=100_000, since=earliest_candle_ts
+        )
+        # Also fetch FUNDING_LOOKBACK records *before* the earliest candle
+        # so the first training rows have historical context.
+        pre_funding_records = self.db.get_funding_rates(
+            limit=FUNDING_LOOKBACK
+        )
+        # Merge: pre-records that are before earliest_candle_ts + all records in range
+        pre_only = [r for r in pre_funding_records if r["timestamp"] < earliest_candle_ts]
+        all_funding_records = pre_only + all_funding_records
+        # Ensure ascending order by timestamp
+        all_funding_records.sort(key=lambda r: r["timestamp"])
+        logger.info(f"Loaded {len(all_funding_records)} funding rate records for training window.")
+
         # --- 1. Candle features: compute ONCE on full DataFrame ---
         from src.features.candle_features import compute_candle_features
         candle_feats_series = compute_candle_features(df)
@@ -161,10 +181,35 @@ class Trainer:
         # --- 3. Cross-TF features: vectorized (matching inference names) ---
         cross_tf_df = self._vectorized_cross_tf(df, start_idx)
 
-        # --- 4. Combine candle + time + cross-TF features ---
-        combined_df = pd.concat([candle_df, time_df, cross_tf_df], axis=1)
+        # --- 4. Funding rate features: per-row (uses pre-loaded records) ---
+        funding_rows = []
+        for i in range(start_idx, len(df)):
+            candle_ts = int(df.iloc[i]["timestamp"])
+            # Binary search: find records with timestamp <= candle_ts
+            # all_funding_records is sorted ascending by timestamp
+            lo, hi = 0, len(all_funding_records)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if all_funding_records[mid]["timestamp"] <= candle_ts:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            # lo is now the index of the first record AFTER candle_ts
+            # Take the last FUNDING_LOOKBACK records up to that point
+            relevant_end = lo
+            relevant_start = max(0, relevant_end - FUNDING_LOOKBACK)
+            filtered_records = all_funding_records[relevant_start:relevant_end]
+            funding_feats = compute_funding_features(
+                funding_records=filtered_records,
+                current_ts_ms=candle_ts,
+            )
+            funding_rows.append(funding_feats)
+        funding_df = pd.DataFrame(funding_rows).reset_index(drop=True)
 
-        # --- 5. Derived features: per-row (needs combined dict) ---
+        # --- 5. Combine candle + time + cross-TF + funding features ---
+        combined_df = pd.concat([candle_df, time_df, cross_tf_df, funding_df], axis=1)
+
+        # --- 6. Derived features: per-row (needs combined dict) ---
         from src.features.derived_features import compute_derived_features
         derived_rows = []
         for i in range(len(combined_df)):
@@ -176,18 +221,18 @@ class Trainer:
         # Merge derived features
         combined_df = pd.concat([combined_df, derived_df], axis=1)
 
-        # --- 6. Validate: replace NaN/inf with 0.0 ---
+        # --- 7. Validate: replace NaN/inf with 0.0 ---
         combined_df = combined_df.apply(pd.to_numeric, errors='coerce').fillna(0.0)
         combined_df = combined_df.replace([np.inf, -np.inf], 0.0)
 
-        # --- 7. Drop constant columns (all same value = no signal) ---
+        # --- 8. Drop constant columns (all same value = no signal) ---
         nunique = combined_df.nunique()
         constant_cols = nunique[nunique <= 1].index.tolist()
         if constant_cols:
             logger.info(f"Dropping {len(constant_cols)} constant columns: {constant_cols[:10]}...")
             combined_df = combined_df.drop(columns=constant_cols)
 
-        # --- 8. Add labels and timestamps ---
+        # --- 9. Add labels and timestamps ---
         combined_df["label"] = df.iloc[start_idx:]["label"].reset_index(drop=True)
         combined_df["_timestamp"] = df.iloc[start_idx:]["timestamp"].reset_index(drop=True)
 
