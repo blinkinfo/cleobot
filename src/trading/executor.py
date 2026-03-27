@@ -155,7 +155,7 @@ class TradingExecutor:
         result = CycleResult(cycle_ts=cycle_ts)
 
         try:
-            # Step 0: Daily reset check
+            # Step 0: Daily reset check + drawdown circuit breaker
             await self._check_daily_reset(cycle_ts)
 
             # Step 1: Settle pending trades
@@ -571,9 +571,23 @@ class TradingExecutor:
     # ---------------------------------------------------------------- #
 
     async def _check_daily_reset(self, cycle_ts: datetime):
-        """Check if we have crossed midnight UTC and reset daily state."""
-        # Risk manager handles its own internal day-boundary check
-        pass
+        """Check if we have crossed midnight UTC, reset daily state if so,
+        and run the 20% daily drawdown circuit breaker check every cycle.
+
+        The drawdown check is performed here (before any trade logic) so it
+        fires as soon as the threshold is crossed, not only at trade time.
+        """
+        # Delegate day-boundary detection and reset to the risk manager.
+        # _refresh_daily_state() compares today's UTC date against the stored
+        # date and calls reset_for_new_day() if they differ.
+        self.risk_manager._refresh_daily_state()
+
+        # Enforce 20% daily drawdown circuit breaker every cycle.
+        # get_current_balance_estimate() returns 0.0 when no starting balance
+        # is set yet (i.e. first cycle of the day), in which case
+        # record_daily_drawdown_check initialises the anchor and returns early.
+        current_balance = self.risk_manager.get_current_balance_estimate()
+        self.risk_manager.record_daily_drawdown_check(current_balance)
 
     # ---------------------------------------------------------------- #
     # RETRAINING

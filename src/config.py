@@ -152,7 +152,3 @@ def load_config() -> Config:
             retrain_hour_utc=_get_env_int("RETRAIN_HOUR_UTC", 4),
         ),
     )
-
-
-# Singleton config instance
-config = load_config()

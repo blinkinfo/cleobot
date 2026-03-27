@@ -28,6 +28,7 @@ from src.models.regime_detector import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     compute_regime_features,
 )
+from src.database import Database
 from src.utils.logger import get_logger
 
 logger = get_logger("models.ensemble")
@@ -94,13 +95,15 @@ class Ensemble:
     regime-aware gating to produce calibrated trading signals.
     """
 
-    def __init__(self, models_dir: str):
+    def __init__(self, models_dir: str, db: Optional[Database] = None):
         """Initialise the ensemble.
 
         Args:
             models_dir: Directory for model storage.
+            db: Optional database instance (used for loading training metadata).
         """
         self.models_dir = models_dir
+        self.db = db
         os.makedirs(models_dir, exist_ok=True)
 
         # Base models (Layer 1)

@@ -320,11 +320,16 @@ class RiskManager:
     def record_daily_drawdown_check(self, current_balance: float):
         """Check and enforce daily drawdown circuit breaker.
 
+        Called every trading cycle so the breaker fires as soon as the
+        20% intraday drawdown threshold is crossed, not only at trade time.
+
         Args:
-            current_balance: Current portfolio balance.
+            current_balance: Estimated current portfolio balance in USD.
         """
         if self._daily_starting_balance <= 0:
-            self._daily_starting_balance = current_balance
+            # First call of the day -- initialise the starting balance anchor.
+            if current_balance > 0:
+                self._daily_starting_balance = current_balance
             return
 
         drawdown = (self._daily_starting_balance - current_balance) / self._daily_starting_balance
@@ -340,6 +345,23 @@ class RiskManager:
             Sum of all open position sizes.
         """
         return sum(self._open_positions.values())
+
+    def get_current_balance_estimate(self) -> float:
+        """Estimate current balance as starting balance plus today's realised PnL.
+
+        Used by the executor to feed `record_daily_drawdown_check` each cycle
+        without requiring an external balance feed.
+
+        Returns 0.0 when `_daily_starting_balance` is not yet set (i.e. no
+        trades have been placed today), which causes `record_daily_drawdown_check`
+        to initialise the anchor rather than fire the breaker.
+
+        Returns:
+            Estimated current balance in USD.
+        """
+        if self._daily_starting_balance <= 0:
+            return 0.0
+        return self._daily_starting_balance + self._daily_pnl
 
     def get_status(self) -> RiskStatus:
         """Get full risk status for Telegram display."""
