@@ -360,8 +360,7 @@ class CleoBot:
     async def _run_initial_training(self):
         """Run initial model training when no models exist."""
         try:
-            from src.models.trainer import ModelTrainer
-            import pandas as pd
+            from src.models.trainer import Trainer
 
             logger.info("Running initial model training...")
             candles = self.db.get_candles("candles_5m", limit=5000)
@@ -372,12 +371,12 @@ class CleoBot:
                 )
                 return
 
-            df_5m = pd.DataFrame(candles)
-            trainer = ModelTrainer(
+            trainer = Trainer(
+                ensemble=self.ensemble,
                 db=self.db,
-                models_dir=self.config.system.models_dir,
+                feature_engine=self.feature_engine,
             )
-            results = trainer.initial_training(df_5m=df_5m)
+            results = trainer.initial_training()
             self.ensemble.load_models()
             logger.info(f"Initial training complete: {results}")
             if self.telegram:
@@ -385,8 +384,8 @@ class CleoBot:
                     f"\u2705 Initial training complete\n"
                     f"Models: {list(results.keys()) if isinstance(results, dict) else 'done'}"
                 )
-        except ImportError:
-            logger.warning("ModelTrainer not available -- skipping initial training.")
+        except ImportError as e:
+            logger.error(f"Trainer import failed: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Initial training failed: {e}", exc_info=True)
 

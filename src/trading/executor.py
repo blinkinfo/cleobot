@@ -613,11 +613,12 @@ class TradingExecutor:
         logger.info("=== FULL RETRAIN STARTING ===")
 
         try:
-            from src.models.trainer import ModelTrainer
+            from src.models.trainer import Trainer
 
-            trainer = ModelTrainer(
+            trainer = Trainer(
+                ensemble=self.ensemble,
                 db=self.db,
-                models_dir=self.config.system.models_dir,
+                feature_engine=self.feature_engine,
             )
 
             df_5m = self._get_df_5m()
@@ -628,10 +629,7 @@ class TradingExecutor:
                 )
                 return
 
-            results = trainer.train_all(
-                df_5m=df_5m,
-                lookback_rows=RETRAIN_LOOKBACK_ROWS,
-            )
+            results = trainer.full_retrain()
 
             self.ensemble.load_models()
 
@@ -641,15 +639,22 @@ class TradingExecutor:
             )
 
             if self.telegram:
+                status = results.get('status', 'unknown')
+                new_acc = results.get('new_accuracy', 0)
+                lgbm_m = results.get('lgbm_metrics', {})
+                tcn_m = results.get('tcn_metrics', {})
+                logreg_m = results.get('logreg_metrics', {})
                 await self.telegram.send_message(
                     f"\U0001F504 Models retrained in {elapsed:.0f}s\n"
-                    f"LGBM val acc: {results.get('lgbm_val_acc', 'N/A')}\n"
-                    f"TCN val acc: {results.get('tcn_val_acc', 'N/A')}\n"
-                    f"LogReg val acc: {results.get('logreg_val_acc', 'N/A')}"
+                    f"Status: {status}\n"
+                    f"Meta val acc: {new_acc:.4f}\n"
+                    f"LGBM val acc: {lgbm_m.get('val_accuracy', 'N/A')}\n"
+                    f"TCN val acc: {tcn_m.get('val_accuracy', 'N/A')}\n"
+                    f"LogReg val acc: {logreg_m.get('val_accuracy', 'N/A')}"
                 )
 
-        except ImportError:
-            logger.info("ModelTrainer not yet available (Phase 5). Retrain deferred.")
+        except ImportError as e:
+            logger.error(f"Trainer import failed: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Retrain failed: {e}", exc_info=True)
             await self._send_error_notification(f"Retrain failed: {e}")

@@ -143,8 +143,8 @@ class MEXCWebSocketClient:
 
         async with websockets.connect(
             MEXC_WS_URL,
-            ping_interval=PING_INTERVAL,
-            ping_timeout=10,
+            ping_interval=None,   # Disable library-level pings (MEXC ignores them)
+            ping_timeout=None,    # We handle keepalive via app-level PING/PONG
             close_timeout=5,
             max_size=10 * 1024 * 1024,  # 10MB max message size
         ) as ws:
@@ -207,16 +207,37 @@ class MEXCWebSocketClient:
         logger.info(f"Subscribed to: depth stream for {self.symbol}")
 
     async def _ping_loop(self, ws):
-        """Send periodic pings to keep the connection alive."""
+        """Send periodic application-level pings to keep the connection alive.
+
+        MEXC requires JSON {"method": "PING"} messages (not WebSocket
+        protocol pings).  We also monitor for stale connections: if no
+        message arrives for 3x the ping interval we break out so the
+        outer reconnect loop can re-establish the session.
+        """
+        stale_threshold = PING_INTERVAL * 3  # seconds with no data
         while self._running:
             try:
                 await asyncio.sleep(PING_INTERVAL)
-                if ws.open:
-                    await ws.send(json.dumps({"method": "PING"}))
+                if not ws.open:
+                    logger.warning("Ping loop: WebSocket no longer open, exiting.")
+                    break
+                await ws.send(json.dumps({"method": "PING"}))
+                # Check for stale connection
+                if (
+                    self._last_message_time > 0
+                    and time.time() - self._last_message_time > stale_threshold
+                ):
+                    logger.warning(
+                        f"No message received for {stale_threshold}s -- "
+                        "closing stale connection."
+                    )
+                    await ws.close()
+                    break
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.debug(f"Ping failed: {e}")
+                logger.warning(f"Ping failed: {e}")
+                break
 
     async def _handle_message(self, raw_message: str):
         """Parse and dispatch a WebSocket message to appropriate callbacks."""
