@@ -47,7 +47,8 @@ async def handle_models_retrain_confirm(update: Update, context: ContextTypes.DE
     bot_app = context.bot_data.get("cleobot")
     if bot_app and hasattr(bot_app, "executor") and bot_app.executor:
         import asyncio
-        asyncio.create_task(bot_app.executor._run_full_retrain())
+        loop = asyncio.get_event_loop()
+        loop.create_task(bot_app.executor._run_full_retrain())
         await query.edit_message_text(
             "\U0001F504 Retrain scheduled. You will be notified when complete.",
             reply_markup=models_keyboard(),

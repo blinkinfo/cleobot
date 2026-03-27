@@ -30,9 +30,9 @@ async def handle_signals_next(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Waiting for next 5-min candle close.",
             "",
             f"Filter state:",
-            f"  Paused: {filt.get('paused', False)}",
-            f"  Streak: {filt.get('consecutive_losses', 0)} consecutive losses",
-            f"  Pause remaining: {filt.get('pause_remaining', 0)} cycle(s)",
+            f"  Paused: {filt.get('pause_cycles_remaining', 0) > 0}",
+            f"  Streak (manual restart): {filt.get('streak_requires_manual_restart', False)}",
+            f"  Pause remaining: {filt.get('pause_cycles_remaining', 0)} cycle(s)",
         ]
     else:
         lines.append("Executor not running.")

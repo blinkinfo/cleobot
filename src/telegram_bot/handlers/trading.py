@@ -100,8 +100,8 @@ async def handle_trading_status(update: Update, context: ContextTypes.DEFAULT_TY
             f"  W/L Today: {risk.get('wins_today', 0)}W / {risk.get('losses_today', 0)}L",
             "",
             "Filter State:",
-            f"  Paused:    {filt.get('paused', False)}",
-            f"  Streak:    {filt.get('consecutive_losses', 0)} losses",
+            f"  Paused:    {filt.get('pause_cycles_remaining', 0) > 0}",
+            f"  Streak:    {filt.get('streak_requires_manual_restart', False)}",
         ]
     await query.edit_message_text("\n".join(lines), reply_markup=trading_keyboard())
 
