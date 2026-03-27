@@ -1,4 +1,8 @@
-"""Backtesting handlers for CleoBot Telegram bot."""
+"""Backtesting handlers for CleoBot Telegram bot.
+
+Integrates with BacktestEngine and BacktestReport for full walk-forward
+backtesting with filter analysis and model comparison reports.
+"""
 
 import asyncio
 from datetime import datetime, timezone, timedelta
@@ -27,98 +31,51 @@ async def _run_backtest(
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        f"\u23F3 Running {days}-day backtest... This may take a moment."
+        "\u23F3 Running {}-day backtest... This may take a moment.".format(days)
     )
+    chat_id = update.effective_chat.id
     bot_app = context.bot_data.get("cleobot")
-    if not (bot_app and hasattr(bot_app, "db") and bot_app.db and
-            hasattr(bot_app, "ensemble") and bot_app.ensemble and
-            bot_app.ensemble.is_ready):
+
+    if not (bot_app and hasattr(bot_app, "db") and bot_app.db):
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Backtest unavailable: DB or models not ready.",
+            chat_id=chat_id,
+            text="Backtest unavailable: database not ready.",
             reply_markup=backtest_keyboard(),
         )
         return
+
     try:
-        since_ts = int(
-            (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
-        )
-        candles = bot_app.db.get_candles("candles_5m", limit=days * 288, since=since_ts)
-        if len(candles) < 50:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"Insufficient candle data for {days}-day backtest ({len(candles)} candles).",
-                reply_markup=backtest_keyboard(),
-            )
-            return
+        from src.backtest.engine import BacktestEngine
+        from src.backtest.report import BacktestReport
 
-        wins = 0
-        losses = 0
-        total_pnl = 0.0
-        skips = 0
+        ensemble = getattr(bot_app, "ensemble", None)
+        engine = BacktestEngine(db=bot_app.db, ensemble=ensemble)
 
-        import pandas as pd
-        df = pd.DataFrame(candles)
-        for col in ("open", "high", "low", "close", "volume"):
-            if col in df.columns:
-                df[col] = df[col].astype(float)
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        # Run in executor to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: engine.run(days=days))
 
-        WIN_PNL = 0.88
-        LOSS_PNL = -1.00
+        report = BacktestReport(result)
+        summary_text = report.summary()
 
-        for i in range(60, len(df) - 1):
-            window = df.iloc[max(0, i - 100):i + 1]
-            try:
-                features = bot_app.feature_engine.compute_from_df(window)
-                if not features:
-                    skips += 1
-                    continue
-                signal = bot_app.ensemble.predict(
-                    features=features,
-                    df_5m=window,
-                )
-                if signal.confidence < signal.regime_threshold:
-                    skips += 1
-                    continue
-                next_candle = df.iloc[i + 1]
-                candle_up = float(next_candle["close"]) > float(next_candle["open"])
-                correct = (signal.direction == "UP" and candle_up) or \
-                          (signal.direction == "DOWN" and not candle_up)
-                if correct:
-                    wins += 1
-                    total_pnl += WIN_PNL
-                else:
-                    losses += 1
-                    total_pnl += LOSS_PNL
-            except Exception:
-                skips += 1
-                continue
+        # Truncate if too long for Telegram
+        if len(summary_text) > 3800:
+            summary_text = summary_text[:3800] + "\n... (truncated)"
 
-        total = wins + losses
-        accuracy = wins / total if total > 0 else 0.0
-        pnl_icon = "\U0001F7E2" if total_pnl >= 0 else "\U0001F534"
-        lines = [
-            f"Backtest Results ({days}d)",
-            "=" * 28,
-            f"Candles:  {len(df)}",
-            f"Traded:   {total}",
-            f"Skipped:  {skips}",
-            f"Wins:     {wins}",
-            f"Losses:   {losses}",
-            f"Accuracy: {accuracy:.1%}",
-            f"P&L:      {pnl_icon} ${total_pnl:+.2f}",
-        ]
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="\n".join(lines),
+            chat_id=chat_id,
+            text=summary_text,
             reply_markup=backtest_keyboard(),
         )
+
+        # Cache result for follow-up reports
+        context.bot_data["last_backtest_result"] = result
+
     except Exception as e:
-        logger.error(f"Backtest error: {e}", exc_info=True)
+        logger.error("Backtest error: {}".format(e), exc_info=True)
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"Backtest failed: {e}",
+            chat_id=chat_id,
+            text="Backtest failed: {}".format(e),
             reply_markup=backtest_keyboard(),
         )
 
@@ -134,27 +91,96 @@ async def handle_backtest_30d(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_backtest_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(
-        "Model comparison backtest is not yet implemented.\n"
-        "Run the 7d or 30d backtest for full ensemble results.",
-        reply_markup=backtest_keyboard(),
-    )
+    await query.edit_message_text("\u23F3 Running model comparison backtest (7d)...")
+    chat_id = update.effective_chat.id
+    bot_app = context.bot_data.get("cleobot")
+
+    if not (bot_app and hasattr(bot_app, "db") and bot_app.db):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Backtest unavailable: database not ready.",
+            reply_markup=backtest_keyboard(),
+        )
+        return
+
+    try:
+        from src.backtest.engine import BacktestEngine
+        from src.backtest.report import BacktestReport
+
+        ensemble = getattr(bot_app, "ensemble", None)
+        engine = BacktestEngine(db=bot_app.db, ensemble=ensemble)
+
+        loop = asyncio.get_event_loop()
+        comparison = await loop.run_in_executor(None, lambda: engine.compare_models(days=7))
+
+        from src.backtest.report import format_model_comparison
+        text = format_model_comparison(comparison)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=backtest_keyboard(),
+        )
+    except Exception as e:
+        logger.error("Model comparison error: {}".format(e), exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Model comparison failed: {}".format(e),
+            reply_markup=backtest_keyboard(),
+        )
 
 
 async def handle_backtest_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    chat_id = update.effective_chat.id
     bot_app = context.bot_data.get("cleobot")
-    lines = ["Filter Analysis", "=" * 25]
-    if bot_app and hasattr(bot_app, "executor") and bot_app.executor:
-        state = bot_app.executor.signal_filter.get_state()
-        lines += [
-            f"Paused:           {state.get('paused', False)}",
-            f"Pause remaining:  {state.get('pause_remaining', 0)}",
-            f"Consec losses:    {state.get('consecutive_losses', 0)}",
-            f"ATR window:       {state.get('atr_window_size', 0)}",
-            f"Dynamic threshold:{state.get('dynamic_threshold', 0):.3f}",
-        ]
-    else:
-        lines.append("Executor not running.")
-    await query.edit_message_text("\n".join(lines), reply_markup=backtest_keyboard())
+
+    # Try to use cached result first (much faster)
+    cached = context.bot_data.get("last_backtest_result")
+    if cached is not None:
+        try:
+            from src.backtest.report import BacktestReport
+            report = BacktestReport(cached)
+            text = report.filter_analysis()
+            await query.edit_message_text(text, reply_markup=backtest_keyboard())
+            return
+        except Exception as e:
+            logger.warning("Failed to use cached backtest result: {}".format(e))
+
+    # No cached result -- run a fresh 7d backtest
+    if not (bot_app and hasattr(bot_app, "db") and bot_app.db):
+        await query.edit_message_text(
+            "Filter analysis unavailable: database not ready.",
+            reply_markup=backtest_keyboard(),
+        )
+        return
+
+    await query.edit_message_text("\u23F3 Running filter analysis (7d backtest)...")
+
+    try:
+        from src.backtest.engine import BacktestEngine
+        from src.backtest.report import BacktestReport
+
+        ensemble = getattr(bot_app, "ensemble", None)
+        engine = BacktestEngine(db=bot_app.db, ensemble=ensemble)
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: engine.run(days=7))
+
+        context.bot_data["last_backtest_result"] = result
+        report = BacktestReport(result)
+        text = report.filter_analysis()
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=backtest_keyboard(),
+        )
+    except Exception as e:
+        logger.error("Filter analysis error: {}".format(e), exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Filter analysis failed: {}".format(e),
+            reply_markup=backtest_keyboard(),
+        )
