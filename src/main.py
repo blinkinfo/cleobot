@@ -233,7 +233,7 @@ class CleoBot:
             logger.info("Step 5/9: Models loaded successfully")
 
         # Step 6: Polymarket client
-        self.polymarket = PolymarketClient(self.config.polymarket)
+        self.polymarket = PolymarketClient(self.config.polymarket, self.db)
         logger.info(
             f"Step 6/9: Polymarket client initialised "
             f"(configured={self.config.polymarket.is_configured})"
