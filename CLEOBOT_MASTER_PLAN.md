@@ -1438,6 +1438,51 @@ Every AI agent session MUST follow these rules:
 - Wire `CleoBotTelegram` into the main orchestrator (`src/main.py`)
 - Pass `cleobot_app` object with `.executor`, `.db`, `.ensemble`, `.feature_engine` attributes into `bot.start()`
 - Call `bot.cache_signal(signal.to_dict())` after each ensemble prediction in executor
-- Add `set_base_trade_size()` method to `RiskManager` if not already present
+- `set_trade_size()` is the correct RiskManager method name (NOT `set_base_trade_size()`)
 - `notify_startup()` and `notify_shutdown()` should be called from the orchestrator lifecycle
 ---
+
+---
+### Session Log: Phase 5 Sanity Check -- Post-Implementation Bug Review
+**Date:** 2026-03-27
+**Phase:** Phase 5 (Telegram Bot) -- Sanity check after initial implementation
+**What Was Done:** Full review of all 4 handler files against actual source APIs. 6 bugs found and fixed.
+
+**Bugs Found and Fixed:**
+
+1. **trading.py -- `signal_filter.pause(cycles)` (BUG: method does not exist)**
+   - `SignalFilter` has no `pause()` method.
+   - Fix: `bot_app.executor.signal_filter._pause_cycles_remaining = cycles` (direct attribute set).
+
+2. **trading.py -- `risk_manager.set_base_trade_size(size)` (BUG: wrong method name)**
+   - `RiskManager` method is `set_trade_size()`, not `set_base_trade_size()`.
+   - Fix: `bot_app.executor.risk_manager.set_trade_size(size)`.
+
+3. **trading.py -- filter state keys `paused` / `consecutive_losses` (BUG: wrong dict keys)**
+   - `SignalFilter.get_state()` returns `pause_cycles_remaining` and `streak_requires_manual_restart`.
+   - Fix: updated `handle_trading_status` to use correct keys.
+
+4. **signals.py -- filter state keys `paused` / `consecutive_losses` / `pause_remaining` (BUG: wrong dict keys)**
+   - Same root cause as bug 3 -- wrong keys used in `handle_signals_next`.
+   - Fix: replaced with `pause_cycles_remaining` and `streak_requires_manual_restart`.
+
+5. **risk.py -- `len(bot_app.executor._pending_settlements)` (BUG: private attribute access)**
+   - Direct access to private `_pending_settlements` list is fragile.
+   - Fix: `bot_app.executor.get_stats().get("pending_settlements", 0)`.
+
+6. **models.py -- `asyncio.create_task(...)` called outside running loop context (BUG)**
+   - `asyncio.create_task()` requires an already-running event loop in scope.
+   - Fix: `loop = asyncio.get_event_loop(); loop.create_task(...)`.
+
+**py_compile Results:**
+- `src/telegram_bot/handlers/trading.py` -- PASS
+- `src/telegram_bot/handlers/risk.py` -- PASS
+- `src/telegram_bot/handlers/models.py` -- PASS
+- `src/telegram_bot/handlers/signals.py` -- PASS
+
+**Corrected Notes for Next Session (Phase 6 - Main Orchestrator):**
+- Wire `CleoBotTelegram` into the main orchestrator (`src/main.py`)
+- Pass `cleobot_app` object with `.executor`, `.db`, `.ensemble`, `.feature_engine` attributes into `bot.start()`
+- Call `bot.cache_signal(signal.to_dict())` after each ensemble prediction in executor
+- `set_trade_size()` is the correct RiskManager method (NOT `set_base_trade_size()`)
+- `notify_startup()` and `notify_shutdown()` should be called from the orchestrator lifecycle
