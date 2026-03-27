@@ -139,6 +139,7 @@ class CleoBot:
         self._start_ts = time.time()
         self._cycle_count = 0
         self._last_candle_ts: Optional[int] = None
+        self._health_task: Optional[asyncio.Task] = None
 
     @property
     def auto_trade_enabled(self) -> bool:
@@ -185,7 +186,7 @@ class CleoBot:
         logger.info(f"Step 2/9: Database ready | 5m={n_5m} candles | trades={n_trades}")
 
         # Start health check server early so Railway doesn't kill us
-        asyncio.ensure_future(start_health_server(self))
+        self._health_task = asyncio.create_task(start_health_server(self))
 
         # Step 3: MEXC data collection
         self.ws_client = MEXCWebSocketClient(symbol=self.config.mexc.symbol)
@@ -251,6 +252,10 @@ class CleoBot:
         )
         # Wire auto_trade flag from config
         self.executor._auto_trade_enabled = self.config.trading.auto_trade_enabled
+        logger.info(
+            f"Step 7/9: Trading executor built | "
+            f"auto_trade={self.config.trading.auto_trade_enabled}"
+        )
 
         # Step 8: Telegram bot
         await self.telegram.start(

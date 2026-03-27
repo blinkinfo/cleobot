@@ -119,12 +119,17 @@ class TradingExecutor:
         self._cycle_count: int = 0
         self._cycles_since_last_trade: int = MIN_CYCLES_BETWEEN_TRADES
         self._cycles_since_incremental: int = 0
-        self._last_retrain_date: str = ""
 
         self._feature_history: List[Dict[str, float]] = []
         self._feature_history_maxlen: int = 200
 
         self._pending_settlements: Dict[int, Dict[str, Any]] = {}
+
+        # Warm-up: collect 12 cycles (~1 hour) of live enriched data
+        # before making predictions, so the initial retrain has orderbook,
+        # funding rate, and Polymarket features available.
+        self._warmup_cycles_remaining: int = 12
+        self._warmup_retrain_done: bool = False
 
         self._total_cycles: int = 0
         self._total_trades: int = 0
@@ -153,6 +158,35 @@ class TradingExecutor:
         )
 
         result = CycleResult(cycle_ts=cycle_ts)
+
+        # --- Warm-up phase: collect live data but skip prediction/trading ---
+        if self._warmup_cycles_remaining > 0:
+            self._warmup_cycles_remaining -= 1
+            try:
+                features = self.feature_engine.compute(
+                    current_ts_ms=candle_ts_ms,
+                    current_orderbook=current_orderbook,
+                )
+                self._update_feature_history(features)
+                await self._update_polymarket_features(features)
+            except Exception as e:
+                logger.debug(f"Warm-up feature collection error (non-fatal): {e}")
+
+            logger.info(
+                f"Warm-up cycle {12 - self._warmup_cycles_remaining}/12 -- "
+                f"collecting enriched data, skipping prediction."
+            )
+            result.duration_s = time.monotonic() - t0
+            return result
+
+        # Trigger a one-time retrain with enriched data after warm-up completes
+        if not self._warmup_retrain_done:
+            self._warmup_retrain_done = True
+            logger.info("Warm-up complete -- triggering retrain with enriched live data.")
+            try:
+                await self._run_full_retrain()
+            except Exception as e:
+                logger.error(f"Post-warmup retrain failed: {e}", exc_info=True)
 
         try:
             # Step 0: Daily reset check + drawdown circuit breaker
@@ -259,8 +293,6 @@ class TradingExecutor:
                 await self._run_incremental_update()
                 self._cycles_since_incremental = 0
 
-            # Step 10: Daily retrain check
-            await self._check_retrain_schedule(cycle_ts)
 
         except RuntimeError as e:
             logger.warning(f"Cycle skipped (startup): {e}")
@@ -592,20 +624,6 @@ class TradingExecutor:
     # ---------------------------------------------------------------- #
     # RETRAINING
     # ---------------------------------------------------------------- #
-
-    async def _check_retrain_schedule(self, cycle_ts: datetime):
-        """Check if the daily 4 AM UTC retrain should run."""
-        retrain_hour = self.config.system.retrain_hour_utc
-        today = cycle_ts.strftime("%Y-%m-%d")
-
-        if (
-            cycle_ts.hour == retrain_hour
-            and cycle_ts.minute < 5
-            and today != self._last_retrain_date
-        ):
-            logger.info(f"Starting scheduled daily retrain at {cycle_ts}")
-            self._last_retrain_date = today
-            await self._run_full_retrain()
 
     async def _run_full_retrain(self):
         """Run the full model retraining pipeline."""

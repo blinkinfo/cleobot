@@ -224,7 +224,7 @@ class MEXCWebSocketClient:
                 if not ws.open:
                     logger.warning("Ping loop: WebSocket no longer open, exiting.")
                     break
-                await ws.send(json.dumps({"method": "PING"}))
+                await ws.send("ping")
                 # Check for stale connection
                 if (
                     self._last_message_time > 0
@@ -244,6 +244,10 @@ class MEXCWebSocketClient:
 
     async def _handle_message(self, raw_message: str):
         """Parse and dispatch a WebSocket message to appropriate callbacks."""
+        # Handle plain-text pong responses from MEXC
+        if raw_message.strip().lower() == "pong":
+            return
+
         try:
             data = json.loads(raw_message)
         except json.JSONDecodeError:
@@ -297,7 +301,10 @@ class MEXCWebSocketClient:
             volume = float(k.get("v", k.get("a", 0)))
             
             # MEXC uses different field for candle close status
-            is_closed = bool(k.get("T", 0))  # T = close time, present when candle is closed
+            # T = scheduled candle close timestamp (ms). The candle is finalised
+            # only when current time has reached or passed that close time.
+            candle_close_ms = int(k.get("T", 0))
+            is_closed = candle_close_ms > 0 and (time.time() * 1000) >= candle_close_ms
 
             for callback in self._callbacks[kline_type]:
                 if asyncio.iscoroutinefunction(callback):

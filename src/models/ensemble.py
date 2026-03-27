@@ -130,6 +130,12 @@ class Ensemble:
         self._prediction_count: int = 0
         self._total_inference_ms: float = 0.0
 
+        # Rate-limit: prevent prediction bursts (e.g. from WS reconnect backlogs).
+        # Cache the last signal and return it if called again within 60 seconds.
+        self._min_prediction_interval: float = 60.0  # seconds
+        self._last_prediction_time: float = 0.0
+        self._cached_signal: Optional[EnsembleSignal] = None
+
     @property
     def is_ready(self) -> bool:
         """Check if all models are trained and ready for prediction."""
@@ -159,6 +165,17 @@ class Ensemble:
             EnsembleSignal with full prediction details.
         """
         t0 = time.monotonic()
+
+        # Rate-limit: return cached signal if called too frequently
+        if (
+            self._cached_signal is not None
+            and (t0 - self._last_prediction_time) < self._min_prediction_interval
+        ):
+            logger.debug(
+                f"Prediction rate-limited ({t0 - self._last_prediction_time:.1f}s since last) "
+                f"-- returning cached signal."
+            )
+            return self._cached_signal
 
         if not self.is_ready:
             logger.warning("Ensemble not ready -- returning neutral signal.")
@@ -247,6 +264,10 @@ class Ensemble:
             f"regime={regime_display}, agree={agreement}/3, "
             f"time={elapsed_ms:.1f}ms)"
         )
+
+        # Cache for rate-limiting
+        self._last_prediction_time = time.monotonic()
+        self._cached_signal = signal
 
         return signal
 

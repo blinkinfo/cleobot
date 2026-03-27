@@ -115,7 +115,7 @@ class Config:
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
-    data_dir = _get_env("DATA_DIR", "./data")
+    data_dir = _get_env("DATA_DIR", "/data")
 
     # Ensure data directories exist
     Path(data_dir).mkdir(parents=True, exist_ok=True)

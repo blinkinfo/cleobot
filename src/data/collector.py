@@ -52,6 +52,14 @@ class DataCollector:
         self._last_orderbook_save_time: float = 0.0
         self._orderbook_save_interval: float = 5.0  # Save orderbook every 5 seconds
 
+        # Deduplication: track last *closed* candle timestamp per timeframe
+        # to prevent reconnection backlogs from re-inserting the same candle.
+        self._last_closed_ts: Dict[str, int] = {
+            "candles_5m": 0,
+            "candles_15m": 0,
+            "candles_1h": 0,
+        }
+
         # Stats
         self.stats = {
             "candles_5m_received": 0,
@@ -128,12 +136,23 @@ class DataCollector:
 
     async def _on_kline_5m(self, timestamp_ms: int, open_: float, high: float,
                             low: float, close: float, volume: float, is_closed: bool):
-        """Handle 5-minute kline updates."""
+        """Handle 5-minute kline updates.
+        
+        Only persist finalized (closed) candles to the database to prevent
+        the feature engine from reading stale intermediate ticks.
+        In-progress ticks still update the live price tracker.
+        """
         try:
-            self.db.insert_candle("candles_5m", timestamp_ms, open_, high, low, close, volume)
+            # Always track latest price from every tick
             self._latest_ticker_price = close
             self.stats["candles_5m_received"] += 1
+
             if is_closed:
+                # Dedup guard: skip if we already saved this candle timestamp
+                if timestamp_ms <= self._last_closed_ts["candles_5m"]:
+                    return
+                self.db.insert_candle("candles_5m", timestamp_ms, open_, high, low, close, volume)
+                self._last_closed_ts["candles_5m"] = timestamp_ms
                 logger.debug(
                     f"5m candle closed: {datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime('%H:%M')} "
                     f"O={open_:.2f} H={high:.2f} L={low:.2f} C={close:.2f} V={volume:.4f}"
@@ -144,20 +163,28 @@ class DataCollector:
 
     async def _on_kline_15m(self, timestamp_ms: int, open_: float, high: float,
                              low: float, close: float, volume: float, is_closed: bool):
-        """Handle 15-minute kline updates."""
+        """Handle 15-minute kline updates. Only persist closed candles."""
         try:
-            self.db.insert_candle("candles_15m", timestamp_ms, open_, high, low, close, volume)
             self.stats["candles_15m_received"] += 1
+            if is_closed:
+                if timestamp_ms <= self._last_closed_ts["candles_15m"]:
+                    return
+                self.db.insert_candle("candles_15m", timestamp_ms, open_, high, low, close, volume)
+                self._last_closed_ts["candles_15m"] = timestamp_ms
         except Exception as e:
             logger.error(f"Error saving 15m kline: {e}")
             self.stats["errors"] += 1
 
     async def _on_kline_1h(self, timestamp_ms: int, open_: float, high: float,
                             low: float, close: float, volume: float, is_closed: bool):
-        """Handle 1-hour kline updates."""
+        """Handle 1-hour kline updates. Only persist closed candles."""
         try:
-            self.db.insert_candle("candles_1h", timestamp_ms, open_, high, low, close, volume)
             self.stats["candles_1h_received"] += 1
+            if is_closed:
+                if timestamp_ms <= self._last_closed_ts["candles_1h"]:
+                    return
+                self.db.insert_candle("candles_1h", timestamp_ms, open_, high, low, close, volume)
+                self._last_closed_ts["candles_1h"] = timestamp_ms
         except Exception as e:
             logger.error(f"Error saving 1h kline: {e}")
             self.stats["errors"] += 1
