@@ -85,7 +85,7 @@ async def handle_risk_exposure(update: Update, context: ContextTypes.DEFAULT_TYP
     lines = ["Current Exposure", "=" * 25]
     if bot_app and hasattr(bot_app, "executor") and bot_app.executor:
         risk = bot_app.executor.risk_manager.get_status()
-        pending = len(bot_app.executor._pending_settlements)
+        pending = bot_app.executor.get_stats().get("pending_settlements", 0)
         lines += [
             f"Open Exposure:   ${risk.open_exposure:.2f}",
             f"Max Exposure:    ${risk.max_exposure:.2f}",

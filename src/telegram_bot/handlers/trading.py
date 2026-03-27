@@ -53,7 +53,7 @@ async def handle_trading_pause(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     bot_app = context.bot_data.get("cleobot")
     if bot_app and hasattr(bot_app, "executor") and bot_app.executor:
-        bot_app.executor.signal_filter.pause(cycles)
+        bot_app.executor.signal_filter._pause_cycles_remaining = cycles
         logger.info(f"Trading paused for {cycles} cycle(s) via Telegram.")
         await query.edit_message_text(
             f"\u23F8\uFE0F Trading paused for {cycles} cycle(s).\n\nWill resume automatically.",
@@ -129,7 +129,7 @@ async def cmd_setsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     bot_app = context.bot_data.get("cleobot")
     if bot_app and hasattr(bot_app, "executor") and bot_app.executor:
-        bot_app.executor.risk_manager.set_base_trade_size(size)
+        bot_app.executor.risk_manager.set_trade_size(size)
         logger.info(f"Trade size set to ${size:.2f} via Telegram.")
         await update.message.reply_text(
             f"\u2705 Base trade size set to ${size:.2f}",
