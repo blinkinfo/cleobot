@@ -189,7 +189,7 @@ class TradingExecutor:
 
             # Step 5: Apply signal filters
             consecutive_losses = self.db.get_consecutive_losses()
-            rolling_accuracy = self.db.get_rolling_accuracy(window=50)
+            rolling_accuracy = self.db.get_rolling_accuracy(n_trades=50)
             n_settled = self.db.get_total_settled_trades()
 
             filter_result = self.signal_filter.evaluate(

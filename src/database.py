@@ -676,6 +676,26 @@ class Database:
             wins = sum(1 for r in rows if r["settlement"] == "WIN")
             return wins / len(rows)
 
+    def get_total_settled_trades(self) -> int:
+        """Return total count of all settled trades."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM trades WHERE settlement IS NOT NULL"
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    def get_recent_settled_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return the most recent settled trades ordered by timestamp desc."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """SELECT * FROM trades WHERE settlement IS NOT NULL
+                   ORDER BY timestamp DESC LIMIT ?""",
+                (limit,),
+            )
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+
     # ==================== MODEL VERSION OPERATIONS ====================
 
     def insert_model_version(self, timestamp: int, model_name: str, version: int,

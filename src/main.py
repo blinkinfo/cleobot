@@ -424,7 +424,7 @@ class CleoBot:
             return
         try:
             stats = self.db.get_trade_stats_today()
-            total = stats.get("settled", 0)
+            total = stats.get("total_trades", 0)
             wins = stats.get("wins", 0)
             losses = stats.get("losses", 0)
             pnl = stats.get("pnl", 0.0)

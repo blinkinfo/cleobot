@@ -268,7 +268,7 @@ class SignalFilter:
             f"regime={signal.regime_display}, "
             f"agreement={signal.agreement}/3, "
             f"streak={consecutive_losses}L, "
-            f"rolling_acc={rolling_accuracy:.3f if rolling_accuracy else 'N/A'})"
+            f"rolling_acc={(f'{rolling_accuracy:.3f}' if rolling_accuracy is not None else 'N/A')})"
             + (f" SKIP: {skip_reason}" if decision == "SKIP" else "")
         )
 

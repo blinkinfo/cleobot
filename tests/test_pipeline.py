@@ -238,7 +238,7 @@ class TestSignalFilter:
             sf.add_atr_observation(100.0 + i * 2)
         result = sf.evaluate(
             signal=signal,
-            current_atr=150.0,
+            current_atr=120.0,
             consecutive_losses=0,
             rolling_accuracy=None,
             n_settled_trades=0,
@@ -434,7 +434,7 @@ class TestTradingExecutorIntegration:
             direction="UP",
             size=1.0,
             fill_price=0.55,
-            fill_time=0.5,
+            fill_time_s=0.5,
             is_simulated=simulated,
         ))
         pm.check_settlement = AsyncMock(return_value=None)
