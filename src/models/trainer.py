@@ -46,6 +46,8 @@ FULL_RETRAIN_DAYS = 14       # Training window
 VALIDATION_DAYS = 2          # Validation window
 PURGE_CANDLES = 2            # Gap between train and validation
 CANDLES_PER_DAY = 288        # 5-min candles per day
+DATA_LOAD_DAYS = 30          # Days of raw candles to load (covers train+val+lookback)
+FEATURE_LOOKBACK_CANDLES = 150  # Candles consumed by feature computation lookback
 OPTUNA_TRIALS = 50           # Trials per model
 ACCEPTANCY_MARGIN = 0.005    # New model must beat old by 0.5%
 DECAY_ACCURACY_FLOOR = 0.53  # Below this, accept any improvement
@@ -98,7 +100,7 @@ class Trainer:
     # ================================================================== #
 
     def _load_training_data(
-        self, days: int = FULL_RETRAIN_DAYS
+        self, days: int = DATA_LOAD_DAYS
     ) -> Optional[pd.DataFrame]:
         """Load and prepare training data from the database.
 
@@ -111,7 +113,7 @@ class Trainer:
         Returns:
             DataFrame with features and 'label' column, or None if insufficient data.
         """
-        limit = days * CANDLES_PER_DAY + 200  # Extra for feature lookback
+        limit = days * CANDLES_PER_DAY + FEATURE_LOOKBACK_CANDLES  # Extra for feature lookback
         candles = self.db.get_candles("candles_5m", limit=limit)
 
         if len(candles) < CANDLES_PER_DAY * 3:  # Need at least 3 days
@@ -420,7 +422,7 @@ class Trainer:
 
         try:
             # 1. Load and prepare data
-            data = self._load_training_data(days=FULL_RETRAIN_DAYS)
+            data = self._load_training_data(days=DATA_LOAD_DAYS)
             if data is None:
                 self._notify("Full retrain ABORTED: insufficient data.")
                 return {"status": "aborted", "reason": "insufficient_data"}
@@ -480,7 +482,7 @@ class Trainer:
 
             # 6. Train regime detector
             df_5m_full = pd.DataFrame(
-                self.db.get_candles("candles_5m", limit=FULL_RETRAIN_DAYS * CANDLES_PER_DAY)
+                self.db.get_candles("candles_5m", limit=DATA_LOAD_DAYS * CANDLES_PER_DAY)
             )
             for col in ("open", "high", "low", "close", "volume"):
                 if col in df_5m_full.columns:
@@ -755,7 +757,7 @@ class Trainer:
 
         try:
             # Load data with emphasis on recent data
-            data = self._load_training_data(days=FULL_RETRAIN_DAYS)
+            data = self._load_training_data(days=DATA_LOAD_DAYS)
             if data is None:
                 self._notify("Emergency retrain ABORTED: insufficient data.")
                 return {"status": "aborted", "reason": "insufficient_data"}

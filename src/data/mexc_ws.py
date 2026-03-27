@@ -145,12 +145,15 @@ class MEXCWebSocketClient:
             MEXC_WS_URL,
             ping_interval=None,   # Disable library-level pings (MEXC ignores them)
             ping_timeout=None,    # We handle keepalive via app-level PING/PONG
-            close_timeout=5,
+            close_timeout=10,
             max_size=10 * 1024 * 1024,  # 10MB max message size
         ) as ws:
             self.ws = ws
             self.stats["connected_since"] = datetime.now(timezone.utc).isoformat()
             self._reconnect_count = 0  # Reset on successful connection
+            # Reset stale timer so the stale-check does not fire
+            # during startup backfill (which blocks the event loop 60+s).
+            self._last_message_time = time.time()
             logger.info("WebSocket connected successfully.")
 
             # Subscribe to all required streams
@@ -214,7 +217,7 @@ class MEXCWebSocketClient:
         message arrives for 3x the ping interval we break out so the
         outer reconnect loop can re-establish the session.
         """
-        stale_threshold = PING_INTERVAL * 3  # seconds with no data
+        stale_threshold = PING_INTERVAL * 5  # seconds with no data (tolerant of startup backfill)
         while self._running:
             try:
                 await asyncio.sleep(PING_INTERVAL)
