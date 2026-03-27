@@ -7,7 +7,7 @@ apscheduler==3.10.4
 lightgbm==4.2.0
 xgboost==2.0.3
 scikit-learn==1.4.0
-torch==2.1.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.1.2+cpu
 hmmlearn==0.3.0
 optuna==3.5.0
 imbalanced-learn==0.12.0
