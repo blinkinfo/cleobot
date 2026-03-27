@@ -125,10 +125,10 @@ class TradingExecutor:
 
         self._pending_settlements: Dict[int, Dict[str, Any]] = {}
 
-        # Warm-up: collect 12 cycles (~1 hour) of live enriched data
+        # Warm-up: collect 2 cycles (~10 minutes) of live enriched data
         # before making predictions, so the initial retrain has orderbook,
         # funding rate, and Polymarket features available.
-        self._warmup_cycles_remaining: int = 12
+        self._warmup_cycles_remaining: int = 2
         self._warmup_retrain_done: bool = False
 
         self._total_cycles: int = 0
@@ -173,7 +173,7 @@ class TradingExecutor:
                 logger.debug(f"Warm-up feature collection error (non-fatal): {e}")
 
             logger.info(
-                f"Warm-up cycle {12 - self._warmup_cycles_remaining}/12 -- "
+                f"Warm-up cycle {2 - self._warmup_cycles_remaining}/2 -- "
                 f"collecting enriched data, skipping prediction."
             )
             result.duration_s = time.monotonic() - t0

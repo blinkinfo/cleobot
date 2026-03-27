@@ -26,7 +26,7 @@ MEXC_WS_URL = "wss://wbs.mexc.com/ws"
 MEXC_FUTURES_WS_URL = "wss://contract.mexc.com/edge"
 
 # Ping interval to keep connection alive
-PING_INTERVAL = 20  # seconds
+PING_INTERVAL = 15  # seconds
 RECONNECT_DELAY_BASE = 1  # seconds
 RECONNECT_DELAY_MAX = 60  # seconds
 
@@ -67,6 +67,21 @@ class MEXCWebSocketClient:
             "reconnections": 0,
             "errors": 0,
             "connected_since": None,
+        }
+
+        # Track the current candle open time per kline type so we can
+        # detect when a *new* candle arrives (= previous candle closed).
+        self._current_candle_open: Dict[str, int] = {
+            "kline_5m": 0,
+            "kline_15m": 0,
+            "kline_1h": 0,
+        }
+        # Buffer the last complete OHLCV per kline type so that when a
+        # new candle arrives we can emit the *final* values of the old one.
+        self._candle_buffer: Dict[str, Optional[Dict[str, Any]]] = {
+            "kline_5m": None,
+            "kline_15m": None,
+            "kline_1h": None,
         }
 
     def on_kline_5m(self, callback: Callable):
@@ -159,6 +174,9 @@ class MEXCWebSocketClient:
             # Subscribe to all required streams
             await self._subscribe(ws)
 
+            # Send an immediate ping to start the keepalive clock
+            await ws.send("ping")
+
             # Start ping task
             ping_task = asyncio.create_task(self._ping_loop(ws))
             self._tasks.append(ping_task)
@@ -212,9 +230,9 @@ class MEXCWebSocketClient:
     async def _ping_loop(self, ws):
         """Send periodic application-level pings to keep the connection alive.
 
-        MEXC requires JSON {"method": "PING"} messages (not WebSocket
-        protocol pings).  We also monitor for stale connections: if no
-        message arrives for 3x the ping interval we break out so the
+        MEXC spot WebSocket accepts plain-text "ping" and replies with
+        plain-text "pong".  We also monitor for stale connections: if no
+        message arrives for 5x the ping interval we break out so the
         outer reconnect loop can re-establish the session.
         """
         stale_threshold = PING_INTERVAL * 5  # seconds with no data (tolerant of startup backfill)
@@ -254,12 +272,17 @@ class MEXCWebSocketClient:
             logger.debug(f"Non-JSON message received: {raw_message[:100]}")
             return
 
-        # Handle PONG responses
-        if data.get("msg") == "PONG" or data.get("code") == 0:
+        # Handle server-initiated ping -- MEXC sends {"ping": <timestamp>}
+        # and expects {"pong": <timestamp>} back to keep the connection alive.
+        if "ping" in data:
+            try:
+                await self.ws.send(json.dumps({"pong": data["ping"]}))
+            except Exception as e:
+                logger.warning(f"Failed to send pong response: {e}")
             return
 
-        # Handle subscription confirmations
-        if "code" in data and data.get("code") == 0:
+        # Handle PONG responses and subscription confirmations (code == 0)
+        if data.get("msg") == "PONG" or data.get("code") == 0:
             return
 
         channel = data.get("c", "")
@@ -286,33 +309,68 @@ class MEXCWebSocketClient:
 
     async def _handle_kline(self, data: Dict[str, Any], kline_type: str):
         """Handle kline (candle) update messages.
-        
+
+        Instead of comparing current time to the candle close timestamp
+        (which is unreliable due to clock skew and network latency), we
+        detect candle closure by tracking the candle open time.  When the
+        open time changes, it means a *new* candle has started and the
+        previous one is finalised.  We then emit the buffered OHLCV of
+        the old candle with ``is_closed=True`` before processing the new
+        tick.
+
         Args:
             data: Kline data from WebSocket.
             kline_type: Type key ('kline_5m', 'kline_15m', 'kline_1h').
         """
         try:
             k = data.get("k", data)
-            timestamp_ms = int(k.get("t", k.get("T", 0)))
+            open_time_ms = int(k.get("t", k.get("T", 0)))
             open_price = float(k.get("o", 0))
             high_price = float(k.get("h", 0))
             low_price = float(k.get("l", 0))
             close_price = float(k.get("c", 0))
             volume = float(k.get("v", k.get("a", 0)))
-            
-            # MEXC uses different field for candle close status
-            # T = scheduled candle close timestamp (ms). The candle is finalised
-            # only when current time has reached or passed that close time.
-            candle_close_ms = int(k.get("T", 0))
-            is_closed = candle_close_ms > 0 and (time.time() * 1000) >= candle_close_ms
 
+            prev_open = self._current_candle_open[kline_type]
+
+            # Detect candle transition: new candle open time differs from tracked one
+            if prev_open > 0 and open_time_ms != prev_open:
+                # The previous candle is now finalised -- emit buffered values
+                buf = self._candle_buffer[kline_type]
+                if buf is not None:
+                    for callback in self._callbacks[kline_type]:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(
+                                buf["timestamp_ms"], buf["open"], buf["high"],
+                                buf["low"], buf["close"], buf["volume"], True,
+                            )
+                        else:
+                            callback(
+                                buf["timestamp_ms"], buf["open"], buf["high"],
+                                buf["low"], buf["close"], buf["volume"], True,
+                            )
+
+            # Update tracked candle open time
+            self._current_candle_open[kline_type] = open_time_ms
+
+            # Buffer the latest tick values (overwrite with each tick)
+            self._candle_buffer[kline_type] = {
+                "timestamp_ms": open_time_ms,
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "volume": volume,
+            }
+
+            # Emit the current tick as a non-closed update
             for callback in self._callbacks[kline_type]:
                 if asyncio.iscoroutinefunction(callback):
-                    await callback(timestamp_ms, open_price, high_price, low_price,
-                                   close_price, volume, is_closed)
+                    await callback(open_time_ms, open_price, high_price, low_price,
+                                   close_price, volume, False)
                 else:
-                    callback(timestamp_ms, open_price, high_price, low_price,
-                             close_price, volume, is_closed)
+                    callback(open_time_ms, open_price, high_price, low_price,
+                             close_price, volume, False)
 
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Error parsing kline data ({kline_type}): {e} | data: {data}")

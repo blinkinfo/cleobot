@@ -149,7 +149,7 @@ class DataCollector:
 
             if is_closed:
                 # Dedup guard: skip if we already saved this candle timestamp
-                if timestamp_ms <= self._last_closed_ts["candles_5m"]:
+                if timestamp_ms < self._last_closed_ts["candles_5m"]:
                     return
                 self.db.insert_candle("candles_5m", timestamp_ms, open_, high, low, close, volume)
                 self._last_closed_ts["candles_5m"] = timestamp_ms
@@ -167,7 +167,7 @@ class DataCollector:
         try:
             self.stats["candles_15m_received"] += 1
             if is_closed:
-                if timestamp_ms <= self._last_closed_ts["candles_15m"]:
+                if timestamp_ms < self._last_closed_ts["candles_15m"]:
                     return
                 self.db.insert_candle("candles_15m", timestamp_ms, open_, high, low, close, volume)
                 self._last_closed_ts["candles_15m"] = timestamp_ms
@@ -181,7 +181,7 @@ class DataCollector:
         try:
             self.stats["candles_1h_received"] += 1
             if is_closed:
-                if timestamp_ms <= self._last_closed_ts["candles_1h"]:
+                if timestamp_ms < self._last_closed_ts["candles_1h"]:
                     return
                 self.db.insert_candle("candles_1h", timestamp_ms, open_, high, low, close, volume)
                 self._last_closed_ts["candles_1h"] = timestamp_ms
