@@ -64,6 +64,14 @@ class DataBackfill:
                 logger.error(f"Error backfilling {interval}: {e}")
                 results[interval] = {"status": "error", "error": str(e)}
 
+        # Backfill funding rate history
+        try:
+            funding_result = await self.backfill_funding_rates()
+            results["funding_rates"] = funding_result
+        except Exception as e:
+            logger.error(f"Funding rate backfill error: {e}")
+            results["funding_rates"] = {"status": "error", "error": str(e)}
+
         logger.info(f"Backfill complete. Results: {results}")
         return results
 
@@ -154,6 +162,56 @@ class DataBackfill:
         else:
             logger.warning(f"  {interval}: No candles returned from API.")
             return {"status": "no_data", "existing": count_before, "added": 0}
+
+    async def backfill_funding_rates(self) -> dict:
+        """Backfill historical funding rate data from MEXC futures API.
+
+        Fetches all available funding rate history, deduplicates against
+        existing DB records, and inserts only new records.
+
+        Returns:
+            Dict with backfill status and counts.
+        """
+        logger.info("Starting funding rate backfill...")
+
+        try:
+            # Fetch all historical records from API
+            all_records = await self.rest.get_funding_rate_history()
+
+            if not all_records:
+                logger.warning("No funding rate history returned from API.")
+                return {"status": "no_data", "fetched": 0, "inserted": 0}
+
+            # Get existing timestamps from DB to deduplicate
+            existing_records = self.db.get_funding_rates(limit=100000)
+            existing_timestamps = {r["timestamp"] for r in existing_records}
+
+            # Insert only new records
+            inserted = 0
+            for record in all_records:
+                if record["timestamp"] not in existing_timestamps:
+                    self.db.insert_funding_rate(
+                        timestamp=record["timestamp"],
+                        rate=record["rate"],
+                        next_settlement=record.get("next_settlement"),
+                    )
+                    inserted += 1
+
+            logger.info(
+                f"Funding rate backfill complete: {len(all_records)} fetched, "
+                f"{inserted} new records inserted "
+                f"({len(existing_timestamps)} already existed)."
+            )
+            return {
+                "status": "backfilled",
+                "fetched": len(all_records),
+                "inserted": inserted,
+                "existing": len(existing_timestamps),
+            }
+
+        except Exception as e:
+            logger.error(f"Funding rate backfill failed: {e}")
+            return {"status": "error", "error": str(e)}
 
     async def check_data_health(self) -> dict:
         """Check the health of stored candle data.

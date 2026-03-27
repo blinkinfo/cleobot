@@ -296,6 +296,87 @@ class MEXCRestClient:
 
         return funding_data
 
+
+    async def get_funding_rate_history(self) -> List[Dict[str, Any]]:
+        """Fetch complete historical funding rate data from MEXC futures API.
+
+        Paginates through all available pages from the contract API.
+        Symbol format for futures is BTC_USDT (underscore separator).
+
+        Returns:
+            List of dicts with keys: 'timestamp' (ms int), 'rate' (float),
+            'next_settlement' (ms int or None). Sorted ascending by timestamp.
+        """
+        # MEXC futures uses underscore symbol format
+        futures_symbol = self.symbol.replace("USDT", "_USDT")
+        all_records: List[Dict[str, Any]] = []
+        page_num = 1
+        page_size = 100
+
+        while True:
+            try:
+                session = await self._get_session()
+                await self._rate_limit()
+                url = (
+                    f"https://contract.mexc.com/api/v1/contract/funding_rate/history"
+                )
+                params = {
+                    "symbol": futures_symbol,
+                    "page_num": page_num,
+                    "page_size": page_size,
+                }
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        logger.warning(
+                            f"Funding rate history page {page_num} returned "
+                            f"HTTP {response.status}. Stopping pagination."
+                        )
+                        break
+                    result = await response.json()
+
+                if not result.get("success") or not result.get("data"):
+                    break
+
+                data = result["data"]
+                # API returns: resultList with items, plus pagination fields
+                items = data.get("resultList", [])
+                if not items:
+                    break
+
+                for item in items:
+                    try:
+                        # MEXC returns settlementTime in ms, fundingRate as string/float
+                        ts_ms = int(item.get("settlementTime", 0))
+                        rate = float(item.get("fundingRate", 0.0))
+                        if ts_ms > 0:
+                            all_records.append({
+                                "timestamp": ts_ms,
+                                "rate": rate,
+                                "next_settlement": None,
+                            })
+                    except (ValueError, TypeError, KeyError) as e:
+                        logger.debug(f"Skipping malformed funding record: {e}")
+                        continue
+
+                # Check if there are more pages
+                total_page = data.get("totalPage", 1)
+                if page_num >= total_page:
+                    break
+                page_num += 1
+                self.stats["requests_made"] += 1
+
+            except Exception as e:
+                logger.error(f"Error fetching funding rate history page {page_num}: {e}")
+                break
+
+        # Sort ascending by timestamp
+        all_records.sort(key=lambda x: x["timestamp"])
+        logger.info(
+            f"Fetched {len(all_records)} historical funding rate records "
+            f"({page_num} pages)"
+        )
+        return all_records
+
     async def get_ticker(self) -> Optional[Dict[str, Any]]:
         """Fetch current ticker data.
         

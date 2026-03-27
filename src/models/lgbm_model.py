@@ -73,7 +73,7 @@ class LightGBMModel:
         y_train: pd.Series,
         X_val: Optional[pd.DataFrame] = None,
         y_val: Optional[pd.Series] = None,
-        num_boost_round: int = 300,
+        num_boost_round: int = 500,
         early_stopping_rounds: int = 20,
     ) -> Dict[str, float]:
         """Train the LightGBM model.
@@ -356,7 +356,7 @@ class LightGBMModel:
                 "objective": "binary",
                 "metric": "binary_logloss",
                 "boosting_type": "gbdt",
-                "num_leaves": trial.suggest_int("num_leaves", 15, 47),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 63),
                 "learning_rate": trial.suggest_float(
                     "learning_rate", 0.02, 0.15, log=True
                 ),

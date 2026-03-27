@@ -48,7 +48,7 @@ PURGE_CANDLES = 2            # Gap between train and validation
 CANDLES_PER_DAY = 288        # 5-min candles per day
 DATA_LOAD_DAYS = 30          # Days of raw candles to load (covers train+val+lookback)
 FEATURE_LOOKBACK_CANDLES = 150  # Candles consumed by feature computation lookback
-OPTUNA_TRIALS = 20           # Trials per model
+OPTUNA_TRIALS = 50           # Trials per model
 ACCEPTANCY_MARGIN = 0.005    # New model must beat old by 0.5%
 DECAY_ACCURACY_FLOOR = 0.53  # Below this, accept any improvement
 SMOTE_MIN_SAMPLES = 50       # Minimum samples for SMOTE
@@ -958,7 +958,7 @@ class Trainer:
                 metrics = model.train(
                     X_tr_sm, y_tr_sm, X_vl, y_vl,
                     num_boost_round=150,
-                    early_stopping_rounds=15,
+                    early_stopping_rounds=30,
                 )
                 accuracies.append(metrics["val_accuracy"])
 
@@ -1006,7 +1006,7 @@ class Trainer:
 
             # LightGBM
             lgbm_fold = LightGBMModel(params=lgbm_params)
-            lgbm_fold.train(X_tr_sm, y_tr_sm, num_boost_round=200, early_stopping_rounds=15)
+            lgbm_fold.train(X_tr_sm, y_tr_sm, num_boost_round=200, early_stopping_rounds=30)
             lgbm_preds = lgbm_fold.predict_proba(X_vl)
 
             # TCN
