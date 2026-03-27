@@ -12,7 +12,7 @@ Input features (per Section 4):
   - Hour-of-day cyclical encoding (2 values: sin, cos)
   Total: ~16 meta-features
 
-Implementation: XGBoost (max_depth=3, n_estimators=50) or Logistic Regression
+Implementation: XGBoost (max_depth=3, n_estimators=30) or Logistic Regression
 This is where 56-58%+ accuracy emerges from combining weaker signals.
 """
 
@@ -139,7 +139,7 @@ class MetaLearner:
     def __init__(
         self,
         max_depth: int = 3,
-        n_estimators: int = 50,
+        n_estimators: int = 30,
         learning_rate: float = 0.1,
     ):
         """Initialise the meta-learner.

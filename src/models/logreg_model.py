@@ -28,7 +28,7 @@ logger = get_logger("models.logreg")
 # Default hyperparameters
 DEFAULT_TOP_FEATURES = 20
 DEFAULT_C = 1.0  # Inverse regularisation strength
-DEFAULT_MAX_ITER = 1000
+DEFAULT_MAX_ITER = 500
 
 
 class LogRegModel:

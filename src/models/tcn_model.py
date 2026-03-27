@@ -36,7 +36,7 @@ DEFAULT_DILATIONS = [1, 2, 4, 8]
 # Training defaults
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_LR = 1e-3
-DEFAULT_EPOCHS = 50
+DEFAULT_EPOCHS = 30
 DEFAULT_WEIGHT_DECAY = 1e-4
 
 
@@ -577,7 +577,7 @@ class TCNModel:
                 "batch_size": trial.suggest_categorical(
                     "batch_size", [32, 64, 128]
                 ),
-                "epochs": trial.suggest_int("epochs", 20, 60),
+                "epochs": trial.suggest_int("epochs", 15, 35),
                 "weight_decay": trial.suggest_float(
                     "weight_decay", 1e-5, 1e-3, log=True
                 ),
