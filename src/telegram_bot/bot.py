@@ -155,7 +155,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             ]
         if hasattr(bot_app, "ensemble") and bot_app.ensemble:
             ready = bot_app.ensemble.is_ready
-            lines.append(f"Models:     {'\u2705 Ready' if ready else '\u26A0\uFE0F Not ready'}")
+            models_ready_str = '\u2705 Ready'
+            models_not_ready_str = '\u26A0\uFE0F Not ready'
+            lines.append(f"Models:     {models_ready_str if ready else models_not_ready_str}")
     await update.message.reply_text("\n".join(lines), reply_markup=main_menu_keyboard())
 
 
