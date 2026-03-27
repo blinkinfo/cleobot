@@ -193,7 +193,7 @@ restartPolicyMaxRetries = 3
   ├── Ensemble inference (< 5s)  
   ├── Filter pipeline (< 1s)
   ├── Risk check (< 1s)
-  └── Order placement (< 25s)
+  └── FOK market order placement (instant fill or kill)
 ```
 
 ## Risk Management

@@ -57,13 +57,27 @@ class MEXCConfig:
 
 @dataclass(frozen=True)
 class PolymarketConfig:
-    api_key: str = ""
-    api_secret: str = ""
-    api_passphrase: str = ""
+    """Polymarket credentials using wallet-based authentication.
+
+    Authentication is done via private key + funder address, which is the
+    standard py-clob-client auth pattern. The client derives L2 API
+    credentials automatically via create_or_derive_api_creds().
+
+    Attributes:
+        private_key: Ethereum private key (hex string, with or without 0x prefix).
+        funder_address: Polymarket funder/proxy wallet address.
+        signature_type: CLOB signature type.
+            0 = EOA (standard wallet)
+            1 = POLY_PROXY (Polymarket proxy wallet)
+            2 = POLY_GNOSIS_SAFE (Polymarket Gnosis Safe, default)
+    """
+    private_key: str = ""
+    funder_address: str = ""
+    signature_type: int = 2
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.api_key and self.api_secret and self.api_passphrase)
+        return bool(self.private_key and self.funder_address)
 
 
 @dataclass(frozen=True)
@@ -106,7 +120,7 @@ class Config:
 def load_config() -> Config:
     """Load configuration from environment variables."""
     data_dir = _get_env("DATA_DIR", "./data")
-    
+
     # Ensure data directories exist
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     Path(os.path.join(data_dir, "models")).mkdir(parents=True, exist_ok=True)
@@ -121,9 +135,9 @@ def load_config() -> Config:
             secret_key=_get_env("MEXC_SECRET_KEY", ""),
         ),
         polymarket=PolymarketConfig(
-            api_key=_get_env("POLYMARKET_API_KEY", ""),
-            api_secret=_get_env("POLYMARKET_API_SECRET", ""),
-            api_passphrase=_get_env("POLYMARKET_API_PASSPHRASE", ""),
+            private_key=_get_env("POLYMARKET_PRIVATE_KEY", ""),
+            funder_address=_get_env("POLYMARKET_FUNDER_ADDRESS", ""),
+            signature_type=_get_env_int("POLYMARKET_SIGNATURE_TYPE", 2),
         ),
         trading=TradingConfig(
             auto_trade_enabled=_get_env_bool("AUTO_TRADE_ENABLED", False),

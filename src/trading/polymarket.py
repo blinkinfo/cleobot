@@ -2,8 +2,7 @@
 
 Handles all Polymarket interactions:
   - Finding the current/next 5-min BTC Up/Down market
-  - Placing limit orders (UP or DOWN)
-  - Checking fill status
+  - Placing FOK (Fill or Kill) market orders (UP or DOWN)
   - Monitoring settlement
   - Recording outcomes to the database
 
@@ -11,6 +10,14 @@ Polymarket BTC 5-min markets are structured as binary options:
   - Each market has a YES token (BTC goes UP) and NO token (BTC goes DOWN)
   - We buy the YES token when predicting UP, NO token when predicting DOWN
   - Markets settle at 1.0 (win) or 0.0 (loss)
+
+Authentication uses wallet-based auth (private key + funder address).
+The client derives L2 API credentials automatically via
+create_or_derive_api_creds() -- no manual API key management needed.
+
+Order execution uses FOK (Fill or Kill) market orders:
+  - Orders either fill completely at the best available price, or are
+    cancelled instantly. No polling loop required.
 
 The client uses py-clob-client for CLOB interactions.
 Graceful fallback: if Polymarket is not configured or unreachable,
@@ -37,14 +44,11 @@ logger = get_logger("trading.polymarket")
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 
+# Polygon (Polymarket chain) chain ID
+POLYGON_CHAIN_ID = 137
+
 # BTC 5-min market search terms
 BTC_MARKET_KEYWORDS = ["BTC", "bitcoin", "5 minute", "5-minute", "5min"]
-
-# Order timeout: cancel and retry after this many seconds
-ORDER_TIMEOUT_SECONDS = 25
-
-# Fill poll interval
-FILL_POLL_INTERVAL = 1.0
 
 # Maximum slippage allowed (in probability units)
 MAX_SLIPPAGE = 0.05  # 5 cents on a $1 bet
@@ -82,7 +86,7 @@ class OrderResult:
         self.order_id = order_id
         self.direction = direction
         self.size = size
-        self.price = price           # Requested price
+        self.price = price           # Requested price (mid at time of order)
         self.fill_price = fill_price # Actual fill price
         self.fill_time_s = fill_time_s
         self.market_id = market_id
@@ -170,8 +174,9 @@ class PolymarketClient:
     """Polymarket CLOB client for CleoBot.
 
     Wraps py-clob-client with:
+      - Wallet-based authentication (private key + funder address)
       - BTC 5-min market discovery
-      - Order placement with fill confirmation
+      - FOK market order placement (instant fill or kill)
       - Settlement monitoring
       - Graceful fallback when not configured
     """
@@ -180,7 +185,7 @@ class PolymarketClient:
         """Initialise the Polymarket client.
 
         Args:
-            config: Polymarket API credentials.
+            config: Polymarket wallet credentials.
             db: Database for recording outcomes.
         """
         self.config = config
@@ -201,35 +206,42 @@ class PolymarketClient:
     # ---------------------------------------------------------------- #
 
     async def connect(self) -> bool:
-        """Connect to Polymarket CLOB API.
+        """Connect to Polymarket CLOB API using wallet-based auth.
+
+        Initialises ClobClient with private key + funder address, then
+        derives L2 API credentials automatically.
 
         Returns:
             True if connected successfully, False otherwise.
         """
         if not self.config.is_configured:
             logger.warning(
-                "Polymarket not configured (missing API credentials). "
-                "Running in simulation mode."
+                "Polymarket not configured (missing POLYMARKET_PRIVATE_KEY or "
+                "POLYMARKET_FUNDER_ADDRESS). Running in simulation mode."
             )
             return False
 
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
 
-            creds = ApiCreds(
-                api_key=self.config.api_key,
-                api_secret=self.config.api_secret,
-                api_passphrase=self.config.api_passphrase,
-            )
             self._client = ClobClient(
                 host=CLOB_HOST,
-                creds=creds,
+                key=self.config.private_key,
+                chain_id=POLYGON_CHAIN_ID,
+                signature_type=self.config.signature_type,
+                funder=self.config.funder_address,
             )
+            # Derive L2 API credentials from the private key automatically
+            self._client.set_api_creds(self._client.create_or_derive_api_creds())
+
             # Verify connection with a lightweight call
             _ = self._client.get_ok()
             self._is_connected = True
-            logger.info("Polymarket CLOB connected successfully.")
+            logger.info(
+                f"Polymarket CLOB connected successfully "
+                f"(signature_type={self.config.signature_type}, "
+                f"funder={self.config.funder_address[:10]}...)."
+            )
             return True
 
         except ImportError:
@@ -292,7 +304,6 @@ class PolymarketClient:
     def _find_market_sync(self, target_time: Optional[datetime]) -> Optional[MarketInfo]:
         """Synchronous market search (runs in executor)."""
         try:
-            # Query gamma API for active markets
             import httpx
 
             params = {
@@ -440,10 +451,11 @@ class PolymarketClient:
         size: float,
         market: MarketInfo,
     ) -> OrderResult:
-        """Place a limit order on Polymarket.
+        """Place a FOK market order on Polymarket.
 
-        Places a limit order at the current best price and waits for fill.
-        If not filled within ORDER_TIMEOUT_SECONDS, cancels and returns failure.
+        Submits a Fill or Kill market order at the best available price.
+        FOK orders either fill completely and immediately, or are cancelled
+        instantly -- no polling loop required.
 
         Args:
             direction: 'UP' or 'DOWN'.
@@ -467,13 +479,9 @@ class PolymarketClient:
                 error="No token ID found for direction",
             )
 
-        # Use current price as limit price (add 1 tick buffer to ensure fill)
-        # In Polymarket, prices range 0-1 with 0.01 tick size
-        limit_price = min(0.99, current_price + 0.01)
-
         logger.info(
-            f"Placing {direction} order: size=${size:.2f}, "
-            f"price={limit_price:.3f}, market={market.condition_id[:16]}..."
+            f"Placing FOK {direction} market order: size=${size:.2f}, "
+            f"mid_price={current_price:.3f}, market={market.condition_id[:16]}..."
         )
 
         t_start = time.monotonic()
@@ -484,8 +492,9 @@ class PolymarketClient:
                 self._place_order_sync,
                 token_id,
                 size,
-                limit_price,
             )
+
+            elapsed = time.monotonic() - t_start
 
             if order_result.get("error"):
                 self._orders_failed += 1
@@ -493,26 +502,38 @@ class PolymarketClient:
                     success=False,
                     direction=direction,
                     size=size,
-                    price=limit_price,
+                    price=current_price,
                     market_id=market.condition_id,
                     token_id=token_id,
                     error=str(order_result.get("error", "Unknown error")),
                 )
 
+            # FOK: if the order was not matched it is killed immediately
+            status = order_result.get("status", "").upper()
+            if status in ("CANCELLED", "CANCELED", "UNMATCHED"):
+                self._orders_failed += 1
+                logger.warning(
+                    f"{direction} FOK order killed (no liquidity): "
+                    f"status={status}"
+                )
+                return OrderResult(
+                    success=False,
+                    direction=direction,
+                    size=size,
+                    price=current_price,
+                    market_id=market.condition_id,
+                    token_id=token_id,
+                    error=f"FOK order killed: {status}",
+                )
+
             order_id = order_result.get("orderID", order_result.get("id", ""))
+            fill_price = float(order_result.get("price", current_price))
             self._orders_placed += 1
-
-            # Poll for fill
-            fill_price, fill_time = await self._wait_for_fill(
-                order_id, limit_price, t_start
-            )
-
-            elapsed = time.monotonic() - t_start
             self._orders_filled += 1
 
             logger.info(
-                f"{direction} order filled: price={fill_price:.3f}, "
-                f"fill_time={elapsed:.1f}s, order_id={order_id}"
+                f"{direction} FOK order filled: price={fill_price:.3f}, "
+                f"elapsed={elapsed:.2f}s, order_id={order_id}"
             )
 
             return OrderResult(
@@ -520,26 +541,13 @@ class PolymarketClient:
                 order_id=order_id,
                 direction=direction,
                 size=size,
-                price=limit_price,
+                price=current_price,
                 fill_price=fill_price,
                 fill_time_s=elapsed,
                 market_id=market.condition_id,
                 token_id=token_id,
             )
 
-        except asyncio.TimeoutError:
-            logger.warning(f"{direction} order timed out after {ORDER_TIMEOUT_SECONDS}s")
-            self._orders_failed += 1
-            await self._cancel_order_safe(token_id)
-            return OrderResult(
-                success=False,
-                direction=direction,
-                size=size,
-                price=limit_price,
-                market_id=market.condition_id,
-                token_id=token_id,
-                error=f"Order timed out after {ORDER_TIMEOUT_SECONDS}s",
-            )
         except Exception as e:
             logger.error(f"Order placement error: {e}", exc_info=True)
             self._orders_failed += 1
@@ -554,109 +562,41 @@ class PolymarketClient:
         self,
         token_id: str,
         size: float,
-        price: float,
     ) -> Dict[str, Any]:
-        """Synchronous order placement via py-clob-client."""
-        try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
+        """Synchronous FOK market order placement via py-clob-client.
 
-            order_args = OrderArgs(
+        Args:
+            token_id: The CLOB token ID to buy.
+            size: USD amount to spend.
+
+        Returns:
+            Dict with order response fields, or {'error': str} on failure.
+        """
+        try:
+            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+
+            order_args = MarketOrderArgs(
                 token_id=token_id,
-                price=price,
-                size=size,
-                side="BUY",
+                amount=size,
             )
-            resp = self._client.create_and_post_order(order_args)
+            signed_order = self._client.create_market_order(order_args)
+            resp = self._client.post_order(signed_order, OrderType.FOK)
 
             # Normalise response
             if hasattr(resp, "orderID"):
-                return {"orderID": resp.orderID, "status": resp.status}
-            elif isinstance(resp, dict):
-                return resp
-            else:
-                return {"orderID": str(resp), "status": "LIVE"}
-
-        except Exception as e:
-            logger.error(f"Order placement error: {e}")
-            return {"error": str(e)}
-
-    async def _wait_for_fill(
-        self,
-        order_id: str,
-        limit_price: float,
-        t_start: float,
-    ) -> Tuple[float, float]:
-        """Poll for order fill until timeout.
-
-        Args:
-            order_id: Order ID to poll.
-            limit_price: Expected price (used as default if fill price unavailable).
-            t_start: Time order was placed (monotonic).
-
-        Returns:
-            Tuple of (fill_price, fill_time_s).
-
-        Raises:
-            asyncio.TimeoutError if not filled within ORDER_TIMEOUT_SECONDS.
-        """
-        deadline = t_start + ORDER_TIMEOUT_SECONDS
-
-        while time.monotonic() < deadline:
-            await asyncio.sleep(FILL_POLL_INTERVAL)
-
-            try:
-                status = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self._get_order_status_sync,
-                    order_id,
-                )
-
-                order_status = status.get("status", "").upper()
-
-                if order_status in ("MATCHED", "FILLED"):
-                    fill_price = float(status.get("price", limit_price))
-                    fill_time = time.monotonic() - t_start
-                    return fill_price, fill_time
-
-                elif order_status in ("CANCELLED", "CANCELED", "EXPIRED"):
-                    logger.warning(f"Order {order_id} was cancelled/expired")
-                    return limit_price, time.monotonic() - t_start
-
-                # Still LIVE -- keep polling
-
-            except Exception as e:
-                logger.warning(f"Error polling order {order_id}: {e}")
-                await asyncio.sleep(FILL_POLL_INTERVAL)
-
-        raise asyncio.TimeoutError(f"Order {order_id} not filled within {ORDER_TIMEOUT_SECONDS}s")
-
-    def _get_order_status_sync(self, order_id: str) -> Dict[str, Any]:
-        """Get order status from CLOB."""
-        try:
-            resp = self._client.get_order(order_id)
-            if hasattr(resp, "status"):
                 return {
-                    "status": resp.status,
-                    "price": getattr(resp, "price", 0.5),
+                    "orderID": resp.orderID,
+                    "status": getattr(resp, "status", "MATCHED"),
+                    "price": getattr(resp, "price", 0.0),
                 }
             elif isinstance(resp, dict):
                 return resp
-            return {"status": "LIVE"}
-        except Exception as e:
-            logger.error(f"Error getting order status: {e}")
-            return {"status": "LIVE"}
+            else:
+                return {"orderID": str(resp), "status": "MATCHED"}
 
-    async def _cancel_order_safe(self, order_id: str):
-        """Cancel an order, ignoring errors."""
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                self._client.cancel,
-                order_id,
-            )
-            logger.debug(f"Cancelled order {order_id}")
         except Exception as e:
-            logger.warning(f"Failed to cancel order {order_id}: {e}")
+            logger.error(f"FOK order placement error: {e}")
+            return {"error": str(e)}
 
     # ---------------------------------------------------------------- #
     # SETTLEMENT MONITORING
@@ -793,12 +733,12 @@ class PolymarketClient:
         size: float,
         market: Optional[MarketInfo],
     ) -> OrderResult:
-        """Simulate an order for paper-trading mode."""
+        """Simulate a FOK market order for paper-trading mode."""
         simulated_price = 0.52 if direction == "UP" else 0.48
-        simulated_fill_time = 1.2
+        simulated_fill_time = 0.05  # FOK fills are near-instant
 
         logger.info(
-            f"[SIMULATED] {direction} order: size=${size:.2f}, "
+            f"[SIMULATED] FOK {direction} market order: size=${size:.2f}, "
             f"price={simulated_price:.3f}"
         )
 

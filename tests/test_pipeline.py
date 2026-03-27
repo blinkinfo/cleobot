@@ -56,7 +56,7 @@ def config(temp_dir):
     return Config(
         telegram=TelegramConfig(bot_token="", chat_id=""),
         mexc=MEXCConfig(api_key="", secret_key=""),
-        polymarket=PolymarketConfig(api_key="", api_secret="", api_passphrase=""),
+        polymarket=PolymarketConfig(private_key="", funder_address="", signature_type=2),
         trading=TradingConfig(
             auto_trade_enabled=False,
             base_trade_size=1.0,
