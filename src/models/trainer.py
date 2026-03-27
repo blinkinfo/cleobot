@@ -168,55 +168,261 @@ class Trainer:
             for k, v in candle_feats_series.items()
         })
 
-        # --- 2. Time features: per-row (lightweight, no DB calls) ---
-        from src.features.time_features import compute_time_features
-        time_rows = []
-        for i in range(start_idx, len(df)):
-            ts_ms = int(df.iloc[i]["timestamp"])
-            slice_df = df.iloc[max(0, i - 149): i + 1]
-            tf = compute_time_features(current_ts_ms=ts_ms, df_5m=slice_df)
-            time_rows.append(tf)
-        time_df = pd.DataFrame(time_rows).reset_index(drop=True)
+        # --- 2. Time features: vectorized (no per-row Python loop) ---
+        # All time features depend only on the candle timestamp and
+        # on the close-price series for time_since_big_move computations.
+        # We compute all columns with numpy array ops over the output slice.
+        from src.features.time_features import SESSION_WINDOWS, FUNDING_INTERVAL_SECS
+        ts_arr = df["timestamp"].values.astype(np.float64)  # ms
+        out_ts = ts_arr[start_idx:]  # shape (n_out,)
+
+        # Datetime decomposition (vectorized via pandas)
+        dt_index = pd.to_datetime(out_ts, unit="ms", utc=True)
+        hour_arr = dt_index.hour.values.astype(np.float64)
+        minute_arr = dt_index.minute.values.astype(np.float64)
+        second_arr = dt_index.second.values.astype(np.float64)
+        dow_arr = dt_index.dayofweek.values.astype(np.float64)
+
+        hour_frac = (hour_arr + minute_arr / 60.0) / 24.0
+        dow_frac = dow_arr / 7.0
+
+        time_hour_sin = np.sin(2 * np.pi * hour_frac)
+        time_hour_cos = np.cos(2 * np.pi * hour_frac)
+        time_dow_sin = np.sin(2 * np.pi * dow_frac)
+        time_dow_cos = np.cos(2 * np.pi * dow_frac)
+
+        # time_to_funding: seconds remaining until next 8h mark / interval
+        current_secs_arr = hour_arr * 3600 + minute_arr * 60 + second_arr
+        elapsed_in_interval = current_secs_arr % FUNDING_INTERVAL_SECS
+        remaining_secs = FUNDING_INTERVAL_SECS - elapsed_in_interval
+        time_to_funding = remaining_secs / FUNDING_INTERVAL_SECS
+
+        # time_session_window: is current minute within any session window?
+        current_mins_arr = (hour_arr * 60 + minute_arr).astype(np.int32)
+        in_window = np.zeros(len(out_ts), dtype=bool)
+        for _s, _e in SESSION_WINDOWS:
+            in_window |= ((current_mins_arr >= _s) & (current_mins_arr < _e))
+        time_session_window = in_window.astype(np.float64)
+
+        # time_since big moves: scan close returns once, then for each row find
+        # the last index where abs return exceeded threshold using searchsorted.
+        closes_all = df["close"].values.astype(np.float64)
+        ts_all = df["timestamp"].values.astype(np.float64)
+        abs_rets = np.abs(np.diff(closes_all) / np.where(closes_all[:-1] == 0, 1.0, closes_all[:-1]))
+        # abs_rets[i] = abs return from candle i to i+1
+        # For output row at df index j (j >= start_idx), we scan abs_rets[:j]
+        # (returns up to and including candle j) for the last threshold crossing.
+        # Vectorized: for each output row j, find last idx in abs_rets[:j] where ret>=thresh.
+        # We use a cumulative "last seen" array built in one forward pass.
+        def _vectorized_mins_since(threshold: float, cap: float = 120.0) -> np.ndarray:
+            n_full = len(abs_rets)  # len(df) - 1
+            last_event_ts = np.full(n_full + 1, -1.0)  # last_event_ts[i] = ts of last event at or before candle i
+            for i in range(n_full):
+                if abs_rets[i] >= threshold:
+                    last_event_ts[i + 1] = ts_all[i + 1]  # event at candle i+1 (the close that moved)
+                else:
+                    last_event_ts[i + 1] = last_event_ts[i]
+            # For output rows (indices start_idx..len(df)-1):
+            out_last = last_event_ts[start_idx:]  # shape (n_out,)
+            no_event = out_last < 0
+            elapsed_mins = np.where(
+                no_event,
+                cap,
+                np.clip((out_ts - out_last) / 60000.0, 0.0, cap),
+            )
+            return elapsed_mins
+
+        time_since_05 = _vectorized_mins_since(0.005)
+        time_since_1  = _vectorized_mins_since(0.010)
+
+        time_df = pd.DataFrame({
+            "time_hour_sin": time_hour_sin,
+            "time_hour_cos": time_hour_cos,
+            "time_dow_sin":  time_dow_sin,
+            "time_dow_cos":  time_dow_cos,
+            "time_since_05pct_move": time_since_05,
+            "time_since_1pct_move":  time_since_1,
+            "time_to_funding":       time_to_funding,
+            "time_session_window":   time_session_window,
+        }).reset_index(drop=True)
 
         # --- 3. Cross-TF features: vectorized (matching inference names) ---
         cross_tf_df = self._vectorized_cross_tf(df, start_idx)
 
-        # --- 4. Funding rate features: per-row (uses pre-loaded records) ---
-        funding_rows = []
-        for i in range(start_idx, len(df)):
-            candle_ts = int(df.iloc[i]["timestamp"])
-            # Binary search: find records with timestamp <= candle_ts
-            # all_funding_records is sorted ascending by timestamp
-            lo, hi = 0, len(all_funding_records)
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if all_funding_records[mid]["timestamp"] <= candle_ts:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            # lo is now the index of the first record AFTER candle_ts
-            # Take the last FUNDING_LOOKBACK records up to that point
-            relevant_end = lo
-            relevant_start = max(0, relevant_end - FUNDING_LOOKBACK)
-            filtered_records = all_funding_records[relevant_start:relevant_end]
-            funding_feats = compute_funding_features(
-                funding_records=filtered_records,
-                current_ts_ms=candle_ts,
-            )
-            funding_rows.append(funding_feats)
-        funding_df = pd.DataFrame(funding_rows).reset_index(drop=True)
+        # --- 4. Funding rate features: vectorized (numpy searchsorted + array ops) ---
+        # Pre-extract arrays from the sorted funding records list
+        if all_funding_records:
+            fr_ts    = np.array([r["timestamp"] for r in all_funding_records], dtype=np.float64)
+            fr_rates = np.array([r["rate"]      for r in all_funding_records], dtype=np.float64)
+            fr_next  = np.array([r.get("next_settlement", 0) or 0
+                                 for r in all_funding_records], dtype=np.float64)
+        else:
+            fr_ts = fr_rates = fr_next = np.array([], dtype=np.float64)
+
+        candle_ts_arr = df["timestamp"].values[start_idx:].astype(np.float64)  # (n_out,)
+        n_out = len(candle_ts_arr)
+        LOOK = FUNDING_LOOKBACK  # 25
+
+        # For each output row: use searchsorted to find the insertion point
+        # (= number of funding records with timestamp <= candle_ts)
+        if len(fr_ts) > 0:
+            insert_pts = np.searchsorted(fr_ts, candle_ts_arr, side="right")  # (n_out,)
+        else:
+            insert_pts = np.zeros(n_out, dtype=np.int64)
+
+        # Pre-allocate output arrays
+        f_rate          = np.zeros(n_out)
+        f_momentum      = np.zeros(n_out)
+        f_time_to_sett  = np.full(n_out, 0.5)
+        f_vs_24h        = np.zeros(n_out)
+        f_vs_7d         = np.zeros(n_out)
+        f_pctile_7d     = np.full(n_out, 0.5)
+        f_direction     = np.zeros(n_out)
+        f_acceleration  = np.zeros(n_out)
+
+        NEUTRAL_THRESHOLD = 1e-5
+        FUNDING_INTERVAL_MS = 8 * 3600 * 1000
+
+        for out_i in range(n_out):
+            end_idx = int(insert_pts[out_i])         # exclusive upper bound
+            start_i = max(0, end_idx - LOOK)
+            window  = fr_rates[start_i:end_idx]       # at most LOOK rates
+            candle_ts_ms = candle_ts_arr[out_i]
+
+            if len(window) == 0:
+                continue  # keep defaults
+
+            cur = window[-1]
+            f_rate[out_i] = cur
+
+            # momentum
+            if len(window) >= 4:
+                f_momentum[out_i] = cur - window[-4]
+            elif len(window) >= 2:
+                f_momentum[out_i] = cur - window[0]
+
+            # time to settlement
+            ns = fr_next[start_i + len(window) - 1] if end_idx > 0 else 0.0
+            if ns > candle_ts_ms:
+                f_time_to_sett[out_i] = float(np.clip(
+                    (ns - candle_ts_ms) / FUNDING_INTERVAL_MS, 0.0, 1.0))
+            else:
+                # estimate from candle timestamp
+                dt_ms = candle_ts_ms
+                secs_in_day = int((dt_ms // 1000) % 86400)
+                interval_s = 8 * 3600
+                elapsed = secs_in_day % interval_s
+                f_time_to_sett[out_i] = (interval_s - elapsed) / interval_s
+
+            # vs 24h avg (last 3 periods)
+            w24 = window[-3:] if len(window) >= 3 else window
+            avg24 = float(np.mean(w24))
+            f_vs_24h[out_i] = cur - avg24
+
+            # vs 7d avg (last 21 periods)
+            w7d = window[-21:] if len(window) >= 21 else window
+            avg7d = float(np.mean(w7d))
+            f_vs_7d[out_i] = cur - avg7d
+
+            # percentile vs 7d
+            if len(w7d) > 1:
+                f_pctile_7d[out_i] = float(np.clip(
+                    np.searchsorted(np.sort(w7d), cur) / len(w7d), 0.0, 1.0))
+
+            # direction
+            if cur > NEUTRAL_THRESHOLD:
+                f_direction[out_i] = 1.0
+            elif cur < -NEUTRAL_THRESHOLD:
+                f_direction[out_i] = -1.0
+
+            # acceleration (2nd diff)
+            tail = window[-4:] if len(window) >= 4 else window[-3:]
+            if len(tail) >= 3:
+                d1 = np.diff(tail)
+                if len(d1) >= 2:
+                    f_acceleration[out_i] = float(d1[-1] - d1[-2])
+
+        funding_df = pd.DataFrame({
+            "funding_rate":                f_rate,
+            "funding_momentum":            f_momentum,
+            "funding_time_to_settlement":  f_time_to_sett,
+            "funding_vs_24h_avg":          f_vs_24h,
+            "funding_vs_7d_avg":           f_vs_7d,
+            "funding_pctile_7d":           f_pctile_7d,
+            "funding_direction":           f_direction,
+            "funding_acceleration":        f_acceleration,
+        }).reset_index(drop=True)
 
         # --- 5. Combine candle + time + cross-TF + funding features ---
         combined_df = pd.concat([candle_df, time_df, cross_tf_df, funding_df], axis=1)
 
-        # --- 6. Derived features: per-row (needs combined dict) ---
-        from src.features.derived_features import compute_derived_features
-        derived_rows = []
-        for i in range(len(combined_df)):
-            row_dict = combined_df.iloc[i].to_dict()
-            derived = compute_derived_features(features=row_dict, feature_history={})
-            derived_rows.append(derived)
-        derived_df = pd.DataFrame(derived_rows).reset_index(drop=True)
+        # --- 6. Derived features: vectorized (pandas column ops, no Python loop) ---
+        # feature_history={} for all training rows (z-scores default to 0),
+        # so every derived feature reduces to a pure arithmetic expression on
+        # combined_df columns -- no per-row Python loop needed.
+        from src.features.derived_features import TOP_FEATURES_FOR_ZSCORE
+
+        def _cget(col, default=0.0):
+            """Return column as float64 Series, or scalar default if missing."""
+            if col in combined_df.columns:
+                return combined_df[col].astype(np.float64)
+            return pd.Series(np.full(len(combined_df), default), dtype=np.float64)
+
+        ob_imb       = _cget("ob_imbalance_5")
+        vol_std12    = _cget("vol_std_12")
+        ret1         = _cget("ret_1")
+        rsi14        = _cget("rsi_14", 50.0)
+        roc6         = _cget("roc_6")
+        vol_delta    = _cget("volume_delta")
+        alignment    = _cget("tf_alignment_score")
+        adx          = _cget("adx_14", 20.0)
+        vwap_dev     = _cget("vwap_dev")
+        atr12        = _cget("atr_12")
+        consec       = _cget("consec_candles")
+
+        # 1. ob_vol_interaction: no history -> vol_regime = 0 -> factor = 1.0
+        derived_ob_vol_interaction = ob_imb * 1.0
+
+        # 2. rsi_divergence: no history -> rsi_change treated as 0
+        derived_rsi_divergence = pd.Series(np.zeros(len(combined_df)), dtype=np.float64)
+
+        # 3. vol_weighted_momentum
+        vol_mult = 1.0 + np.clip(vol_delta, -0.9, 3.0)
+        derived_vol_weighted_momentum = roc6 * vol_mult
+
+        # 4. trend_alignment_strength
+        adx_norm = np.clip(adx / 50.0, 0.0, 1.0)
+        derived_trend_alignment_strength = (alignment / 2.0) * adx_norm
+
+        # 5. mean_reversion: no history -> low_vol_indicator = 0.5
+        derived_mean_reversion = -vwap_dev * 0.5
+
+        # 6. momentum_exhaustion
+        is_rsi_extreme  = ((rsi14 > 70) | (rsi14 < 30)).astype(np.float64)
+        is_vol_declining = (vol_delta < -0.2).astype(np.float64)
+        is_long_streak   = (consec.abs() >= 3).astype(np.float64)
+        exhaustion_score = (is_rsi_extreme + is_vol_declining + is_long_streak) / 3.0
+        derived_momentum_exhaustion = np.where(
+            rsi14 > 70, -exhaustion_score,
+            np.where(rsi14 < 30, exhaustion_score, 0.0)
+        )
+
+        # 7. breakout_signal: no history -> is_compressed=0, is_surge=0 -> 0
+        derived_breakout_signal = pd.Series(np.zeros(len(combined_df)), dtype=np.float64)
+
+        # 8-17. z-scores: no history -> all 0
+        derived_df = pd.DataFrame({
+            "derived_ob_vol_interaction":      derived_ob_vol_interaction,
+            "derived_rsi_divergence":          derived_rsi_divergence,
+            "derived_vol_weighted_momentum":   derived_vol_weighted_momentum,
+            "derived_trend_alignment_strength": derived_trend_alignment_strength,
+            "derived_mean_reversion":          derived_mean_reversion,
+            "derived_momentum_exhaustion":     pd.Series(derived_momentum_exhaustion,
+                                                         dtype=np.float64),
+            "derived_breakout_signal":         derived_breakout_signal,
+            **{f"z_{fn}": pd.Series(np.zeros(len(combined_df)), dtype=np.float64)
+               for fn in TOP_FEATURES_FOR_ZSCORE},
+        }).reset_index(drop=True)
 
         # Merge derived features
         combined_df = pd.concat([combined_df, derived_df], axis=1)
@@ -495,9 +701,14 @@ class Trainer:
             )
 
             # 5. Generate OOF predictions for meta-learner
-            logger.info("Generating OOF predictions for meta-learner...")
+            # --- OPT 2: Limit OOF to last 5 folds (most recent, saves ~64% compute) ---
+            oof_splits = splits[-5:] if len(splits) > 5 else splits
+            logger.info(
+                f"Generating OOF predictions for meta-learner "
+                f"({len(oof_splits)} of {len(splits)} folds)..."
+            )
             oof_lgbm, oof_tcn, oof_logreg, oof_labels, oof_meta = (
-                self._generate_oof_predictions(X, y, splits, best_lgbm_params, lgbm_new)
+                self._generate_oof_predictions(X, y, oof_splits, best_lgbm_params, lgbm_new)
             )
 
             # 6. Train regime detector
@@ -974,6 +1185,9 @@ class Trainer:
     ) -> Dict[str, Any]:
         """Tune LightGBM hyperparameters using Optuna.
 
+        SMOTE is pre-computed once per fold outside the Optuna objective so
+        that the 50 trials never redundantly re-run SMOTE on identical data.
+
         Args:
             X: Full feature DataFrame.
             y: Full label Series.
@@ -984,21 +1198,31 @@ class Trainer:
         """
         param_space = LightGBMModel().get_optuna_param_space()
 
+        # Use a subset of splits for speed (last 3)
+        eval_splits = splits[-3:] if len(splits) > 3 else splits
+
+        # --- OPT 1: Pre-cache SMOTE for each fold ONCE before all trials ---
+        # SMOTE depends only on (X_tr, y_tr), not on hyperparameters, so it
+        # is identical across all 50 Optuna trials for the same fold.
+        smote_cache: List[Tuple] = []
+        for train_idx, val_idx in eval_splits:
+            X_tr = X.iloc[train_idx]
+            y_tr = y.iloc[train_idx]
+            X_vl = X.iloc[val_idx]
+            y_vl = y.iloc[val_idx]
+            X_tr_sm, y_tr_sm = self._apply_smote(X_tr, y_tr)
+            smote_cache.append((X_tr_sm, y_tr_sm, X_vl, y_vl))
+        logger.info(
+            f"SMOTE cached for {len(smote_cache)} Optuna eval folds "
+            f"(saves {OPTUNA_TRIALS * len(smote_cache) - len(smote_cache)} redundant SMOTE calls)."
+        )
+
         def objective(trial):
             params = param_space(trial)
             accuracies = []
 
-            # Use a subset of splits for speed
-            eval_splits = splits[-3:] if len(splits) > 3 else splits
-
-            for train_idx, val_idx in eval_splits:
-                X_tr = X.iloc[train_idx]
-                y_tr = y.iloc[train_idx]
-                X_vl = X.iloc[val_idx]
-                y_vl = y.iloc[val_idx]
-
-                X_tr_sm, y_tr_sm = self._apply_smote(X_tr, y_tr)
-
+            # Reuse pre-computed SMOTE data -- no SMOTE call here
+            for X_tr_sm, y_tr_sm, X_vl, y_vl in smote_cache:
                 model = LightGBMModel(params=params)
                 metrics = model.train(
                     X_tr_sm, y_tr_sm, X_vl, y_vl,
