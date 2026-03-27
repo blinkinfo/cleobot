@@ -1573,3 +1573,48 @@ Every AI agent session MUST follow these rules:
 - Monitor first few cycles in SIGNALS ONLY mode before enabling AUTO_TRADE_ENABLED=true
 - After 50+ signals, check rolling accuracy before enabling live trading
 - The executor's run_cycle in test mode will hit db.get_total_settled_trades() -- if that method does not exist in current db, executor error is caught gracefully and logged
+
+---
+
+### Session: 2026-03-27 | Phase 7 Addendum: Polymarket Wallet-Auth + FOK Orders
+
+**Commit:** a8db59a Phase 7: Switch Polymarket to wallet-based auth + FOK market orders
+
+**What Was Changed:**
+
+- `src/config.py` -- PolymarketConfig field changes:
+  - Removed: `api_key`, `api_secret`, `api_passphrase`
+  - Added: `private_key` (Ethereum private key, hex string), `funder_address` (Polymarket funder/proxy wallet address), `signature_type` (int, default 2 = POLY_GNOSIS_SAFE)
+  - `is_configured` property updated: now checks `private_key and funder_address` (passphrase no longer required)
+  - `load_config()` updated: reads `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE` from env
+  - Removed env vars: `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_API_PASSPHRASE`
+  - Added env vars:
+    - `POLYMARKET_PRIVATE_KEY` -- Ethereum private key for wallet-based auth
+    - `POLYMARKET_FUNDER_ADDRESS` -- Polymarket funder/proxy wallet address
+    - `POLYMARKET_SIGNATURE_TYPE` -- CLOB signature type (0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE, default 2)
+
+- `src/trading/polymarket.py` -- Order execution overhaul:
+  - Removed: limit order placement (`OrderArgs`, `create_and_post_order`)
+  - Removed: fill polling loop (`_wait_for_fill`, `FILL_POLL_INTERVAL = 1.0`)
+  - Removed: order timeout / cancel logic (`ORDER_TIMEOUT_SECONDS = 25`, `_cancel_order_safe`, `_get_order_status_sync`)
+  - Added: FOK (Fill or Kill) market order placement via `MarketOrderArgs` + `post_order(..., OrderType.FOK)`
+  - Added: wallet-based auth in `connect()` -- `ClobClient(key=..., chain_id=137, signature_type=..., funder=...)` + `create_or_derive_api_creds()`
+  - Added: `POLYGON_CHAIN_ID = 137` constant
+  - Simulation mode updated: `simulated_fill_time` reduced from 1.2s to 0.05s to reflect FOK near-instant fills
+  - Order result `price` field now records mid-price at time of order (not limit_price)
+
+- `tests/test_pipeline.py` -- Config fixture updated:
+  - `PolymarketConfig(api_key="", api_secret="", api_passphrase="")` -> `PolymarketConfig(private_key="", funder_address="", signature_type=2)`
+
+- `README.md` -- Environment variables table updated:
+  - Removed rows: `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_API_PASSPHRASE`
+  - Added rows: `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE`
+  - Cycle timing updated: `Order placement (< 25s)` -> `FOK market order placement (instant fill or kill)`
+
+**Decisions Made:**
+- Wallet-based auth is the standard py-clob-client pattern; API key auth is deprecated upstream
+- FOK orders eliminate the 25s polling window, reducing cycle time from up to 58s to under 40s
+- signature_type defaults to 2 (POLY_GNOSIS_SAFE) to match most Polymarket accounts created via the web UI
+- `is_configured` no longer requires passphrase -- private_key + funder_address is sufficient for auth
+
+**All 38 tests pass.**
