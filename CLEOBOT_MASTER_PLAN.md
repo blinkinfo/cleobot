@@ -1372,3 +1372,35 @@ Every AI agent session MUST follow these rules:
 - Phase 5 is next: Model Training Pipeline (ModelTrainer class, train_all(), incremental updates).
 - The executor's `_run_full_retrain()` already calls `ModelTrainer` -- just needs the implementation.
 - Database methods called by executor/risk_manager that may need adding: `get_rolling_accuracy(window)`, `get_total_settled_trades()`, `get_recent_settled_trades(limit)`, `record_trade(...)`, `settle_trade(...)`. Verify these exist in database.py before Phase 5 begins.
+
+---
+### Session Log: Phase 6 (partial) -- Telegram Bot Handler Files
+**Date:** 2026-03-27
+**Phase Completed:** Telegram Bot Handler Files (7 handler modules)
+**What Was Built:**
+- `src/telegram_bot/handlers/trading.py` -- Trading control handlers: handle_trading_menu, handle_trading_start, handle_trading_stop, handle_trading_pause (1/3 cycles), handle_trading_status, handle_set_size, cmd_setsize. Enables full auto-trade toggle, pause, and dynamic trade size adjustment via Telegram.
+- `src/telegram_bot/handlers/signals.py` -- Signal analysis handlers: handle_signals_menu, handle_signals_next, handle_signals_last5, handle_signals_breakdown, handle_signals_regime, handle_signals_features, handle_signal_detail, handle_signal_force. Shows model breakdown, regime state, feature importances, and last 5 signals.
+- `src/telegram_bot/handlers/performance.py` -- Performance tracking: handle_performance_menu, handle_perf_today, handle_perf_weekly, handle_perf_monthly, handle_perf_hourly, handle_perf_streaks, handle_perf_equity. Includes equity curve ASCII bar chart, hourly heatmap, rolling accuracy, and streak history.
+- `src/telegram_bot/handlers/models.py` -- ML model management: handle_models_menu, handle_models_health, handle_models_retrain (with confirm_keyboard), handle_models_retrain_confirm (triggers asyncio task), handle_models_features, handle_models_compare, handle_models_regime_history. Uses format_model_health card from cards.py.
+- `src/telegram_bot/handlers/backtest.py` -- Backtesting: handle_backtest_menu, _run_backtest (shared 7d/30d logic with pandas DataFrame walk-forward simulation), handle_backtest_7d, handle_backtest_30d, handle_backtest_compare (stub), handle_backtest_filters. Full candle-based walk-forward using feature engine + ensemble.
+- `src/telegram_bot/handlers/risk.py` -- Risk management: handle_risk_menu, handle_risk_drawdown, handle_risk_limits (reads config + _base_trade_size), handle_risk_update (shows /setsize instructions), handle_risk_exposure (utilisation %). All read live from executor.risk_manager.
+- `src/telegram_bot/handlers/system.py` -- System monitoring: handle_system_menu, handle_system_latency (DB round-trip + Polymarket status), handle_system_uptime, handle_system_logs (last 10 lines), handle_system_errors (ERROR/CRITICAL filter), handle_system_db (file size + trade counts). Reads log_path and db_path from context.bot_data.
+
+**Decisions Made:**
+- All handlers read bot_app from context.bot_data["cleobot"] -- null-safe with graceful fallback messages.
+- Backtest uses WIN_PNL=0.88, LOSS_PNL=-1.00 constants matching Polymarket binary market payouts.
+- handle_trading_pause delegates to executor.signal_filter.pause(cycles) matching SignalFilter API.
+- handle_models_retrain_confirm uses asyncio.create_task() to schedule retrain non-blocking.
+- Equity curve uses ASCII bar chart (+ or - chars scaled by $5 per char, max 20 chars).
+
+**Tests Passed:**
+- py_compile: all 7 handler files -- PASS (exit code 0)
+- py_compile: keyboards.py, cards.py, notifications.py -- PASS (exit code 0)
+
+**Issues/Notes for Next Session:**
+- bot.py (handler registration) still needs to be implemented -- it wires all these handlers to callback_query patterns.
+- The `__init__.py` for the handlers package should be created or verified.
+- keyboards.py already exists (syntax verified) -- confirm all keyboard functions referenced by handlers are exported.
+- notifications.py already exists -- verify send_signal_notification, send_settlement_notification, etc. are present.
+
+**Commit:** Phase 6 (partial): All 7 Telegram bot handler files
