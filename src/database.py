@@ -1,11 +1,12 @@
 """CleoBot SQLite database manager with all table schemas."""
 
-import sqlite3
 import json
+import os
+import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils.logger import get_logger
 
@@ -14,14 +15,14 @@ logger = get_logger("database")
 
 class Database:
     """Thread-safe SQLite database manager for CleoBot.
-    
+
     Manages all persistent data: candles, orderbook snapshots, funding rates,
     signals, trades, model versions, and session stats.
     """
 
     def __init__(self, db_path: str):
         """Initialize database manager.
-        
+
         Args:
             db_path: Path to SQLite database file.
         """
@@ -107,7 +108,7 @@ class Database:
                 )
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_orderbook_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_orderbook_timestamp
                 ON orderbook_snapshots(timestamp)
             """)
 
@@ -121,7 +122,7 @@ class Database:
                 )
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_funding_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_funding_timestamp
                 ON funding_rates(timestamp)
             """)
 
@@ -140,16 +141,16 @@ class Database:
                 )
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_signals_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_signals_timestamp
                 ON signals(timestamp)
             """)
 
-            # Trades
+            # Trades -- extended schema with Polymarket order metadata
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp INTEGER NOT NULL,
-                    signal_id INTEGER NOT NULL,
+                    signal_id INTEGER NOT NULL DEFAULT 0,
                     direction TEXT NOT NULL,
                     entry_price REAL,
                     polymarket_odds REAL,
@@ -157,15 +158,21 @@ class Database:
                     settlement TEXT,
                     pnl REAL,
                     trade_size REAL NOT NULL DEFAULT 1.0,
-                    FOREIGN KEY (signal_id) REFERENCES signals(id)
+                    order_id TEXT,
+                    market_id TEXT,
+                    token_id TEXT,
+                    is_simulated INTEGER NOT NULL DEFAULT 1,
+                    is_premium INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT,
+                    signal_json TEXT
                 )
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_trades_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_trades_timestamp
                 ON trades(timestamp)
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_trades_signal_id 
+                CREATE INDEX IF NOT EXISTS idx_trades_signal_id
                 ON trades(signal_id)
             """)
 
@@ -201,7 +208,7 @@ class Database:
     def insert_candle(self, table: str, timestamp: int, open_: float, high: float,
                       low: float, close: float, volume: float):
         """Insert or replace a candle record.
-        
+
         Args:
             table: Table name ('candles_5m', 'candles_15m', 'candles_1h').
             timestamp: Candle open timestamp in milliseconds.
@@ -222,7 +229,7 @@ class Database:
 
     def insert_candles_batch(self, table: str, candles: List[Tuple]):
         """Insert multiple candle records at once.
-        
+
         Args:
             table: Table name.
             candles: List of (timestamp, open, high, low, close, volume) tuples.
@@ -237,15 +244,15 @@ class Database:
             )
         logger.debug(f"Inserted {len(candles)} candles into {table}.")
 
-    def get_candles(self, table: str, limit: int = 100, 
+    def get_candles(self, table: str, limit: int = 100,
                     since: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get recent candles from a table.
-        
+
         Args:
             table: Table name.
             limit: Maximum number of candles to return.
             since: Only return candles after this timestamp (ms).
-        
+
         Returns:
             List of candle dicts sorted by timestamp ascending.
         """
@@ -268,10 +275,10 @@ class Database:
 
     def get_latest_candle_timestamp(self, table: str) -> Optional[int]:
         """Get the timestamp of the most recent candle.
-        
+
         Args:
             table: Table name.
-        
+
         Returns:
             Timestamp in milliseconds, or None if table is empty.
         """
@@ -284,10 +291,10 @@ class Database:
 
     def get_candle_count(self, table: str) -> int:
         """Get the number of candles in a table.
-        
+
         Args:
             table: Table name.
-        
+
         Returns:
             Number of candle records.
         """
@@ -302,7 +309,7 @@ class Database:
     def insert_orderbook_snapshot(self, timestamp: int, bids: List, asks: List,
                                   mid_price: float, spread: float):
         """Insert an orderbook snapshot.
-        
+
         Args:
             timestamp: Snapshot timestamp in milliseconds.
             bids: List of [price, quantity] bid levels.
@@ -312,18 +319,20 @@ class Database:
         """
         with self.get_cursor() as cursor:
             cursor.execute(
-                "INSERT INTO orderbook_snapshots (timestamp, bids_json, asks_json, mid_price, spread) "
+                "INSERT INTO orderbook_snapshots "
+                "(timestamp, bids_json, asks_json, mid_price, spread) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (timestamp, json.dumps(bids), json.dumps(asks), mid_price, spread),
             )
 
-    def get_orderbook_snapshots(self, since: int, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_orderbook_snapshots(self, since: int,
+                                limit: int = 100) -> List[Dict[str, Any]]:
         """Get orderbook snapshots since a timestamp.
-        
+
         Args:
             since: Timestamp in milliseconds.
             limit: Maximum number of snapshots.
-        
+
         Returns:
             List of snapshot dicts with parsed bids/asks.
         """
@@ -343,7 +352,7 @@ class Database:
 
     def get_latest_orderbook(self) -> Optional[Dict[str, Any]]:
         """Get the most recent orderbook snapshot.
-        
+
         Returns:
             Snapshot dict or None.
         """
@@ -361,11 +370,13 @@ class Database:
 
     def cleanup_old_orderbook(self, days: int = 7):
         """Delete orderbook snapshots older than N days.
-        
+
         Args:
             days: Number of days of data to retain.
         """
-        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+        cutoff = int(
+            (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
+        )
         with self.get_cursor() as cursor:
             cursor.execute(
                 "DELETE FROM orderbook_snapshots WHERE timestamp < ?", (cutoff,)
@@ -376,10 +387,10 @@ class Database:
 
     # ==================== FUNDING RATE OPERATIONS ====================
 
-    def insert_funding_rate(self, timestamp: int, rate: float, 
+    def insert_funding_rate(self, timestamp: int, rate: float,
                             next_settlement: Optional[int] = None):
         """Insert a funding rate record.
-        
+
         Args:
             timestamp: Timestamp in milliseconds.
             rate: Funding rate value.
@@ -387,18 +398,19 @@ class Database:
         """
         with self.get_cursor() as cursor:
             cursor.execute(
-                "INSERT INTO funding_rates (timestamp, rate, next_settlement) VALUES (?, ?, ?)",
+                "INSERT INTO funding_rates (timestamp, rate, next_settlement) "
+                "VALUES (?, ?, ?)",
                 (timestamp, rate, next_settlement),
             )
 
-    def get_funding_rates(self, limit: int = 100, 
+    def get_funding_rates(self, limit: int = 100,
                           since: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get recent funding rates.
-        
+
         Args:
             limit: Maximum number of records.
             since: Only return records after this timestamp (ms).
-        
+
         Returns:
             List of funding rate dicts.
         """
@@ -420,7 +432,7 @@ class Database:
 
     def get_latest_funding_rate(self) -> Optional[Dict[str, Any]]:
         """Get the most recent funding rate.
-        
+
         Returns:
             Funding rate dict or None.
         """
@@ -434,10 +446,10 @@ class Database:
     # ==================== SIGNAL OPERATIONS ====================
 
     def insert_signal(self, timestamp: int, direction: str, confidence: float,
-                      models: Dict, regime: str, filters: Dict, 
+                      models: Dict, regime: str, filters: Dict,
                       traded: bool = False) -> int:
         """Insert a signal record and return its ID.
-        
+
         Args:
             timestamp: Signal timestamp in milliseconds.
             direction: 'UP' or 'DOWN'.
@@ -446,7 +458,7 @@ class Database:
             regime: Current regime classification.
             filters: Dict of filter verdicts.
             traded: Whether a trade was placed.
-        
+
         Returns:
             The signal ID (primary key).
         """
@@ -454,14 +466,16 @@ class Database:
             cursor.execute(
                 "INSERT INTO signals (timestamp, direction, confidence, models_json, "
                 "regime, filters_json, traded) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (timestamp, direction, confidence, json.dumps(models),
-                 regime, json.dumps(filters), int(traded)),
+                (
+                    timestamp, direction, confidence,
+                    json.dumps(models), regime, json.dumps(filters), int(traded),
+                ),
             )
             return cursor.lastrowid
 
     def update_signal_outcome(self, signal_id: int, outcome: str):
         """Update a signal's outcome after settlement.
-        
+
         Args:
             signal_id: Signal ID.
             outcome: 'WIN', 'LOSS', or 'PUSH'.
@@ -474,10 +488,10 @@ class Database:
 
     def get_recent_signals(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent signals.
-        
+
         Args:
             limit: Maximum number of signals.
-        
+
         Returns:
             List of signal dicts with parsed JSON fields.
         """
@@ -497,10 +511,10 @@ class Database:
 
     def get_signals_since(self, since: int) -> List[Dict[str, Any]]:
         """Get all signals since a timestamp.
-        
+
         Args:
             since: Timestamp in milliseconds.
-        
+
         Returns:
             List of signal dicts.
         """
@@ -526,13 +540,25 @@ class Database:
 
     # ==================== TRADE OPERATIONS ====================
 
-    def insert_trade(self, timestamp: int, signal_id: int, direction: str,
-                     entry_price: Optional[float] = None, 
-                     polymarket_odds: Optional[float] = None,
-                     fill_time: Optional[float] = None,
-                     trade_size: float = 1.0) -> int:
+    def insert_trade(
+        self,
+        timestamp: int,
+        signal_id: int,
+        direction: str,
+        entry_price: Optional[float] = None,
+        polymarket_odds: Optional[float] = None,
+        fill_time: Optional[float] = None,
+        trade_size: float = 1.0,
+        order_id: Optional[str] = None,
+        market_id: Optional[str] = None,
+        token_id: Optional[str] = None,
+        is_simulated: bool = True,
+        is_premium: bool = False,
+        created_at: Optional[str] = None,
+        signal_json: Optional[str] = None,
+    ) -> int:
         """Insert a trade record and return its ID.
-        
+
         Args:
             timestamp: Trade timestamp in milliseconds.
             signal_id: Associated signal ID.
@@ -541,22 +567,142 @@ class Database:
             polymarket_odds: Polymarket odds at fill.
             fill_time: Time to fill in seconds.
             trade_size: Trade size in USD.
-        
+            order_id: Polymarket order ID.
+            market_id: Polymarket market ID.
+            token_id: Polymarket token ID.
+            is_simulated: True if this is a paper trade.
+            is_premium: True if signal met premium criteria.
+            created_at: ISO timestamp string of when the trade was placed.
+            signal_json: JSON-serialised signal dict.
+
         Returns:
             The trade ID.
         """
+        if created_at is None:
+            created_at = datetime.now(timezone.utc).isoformat()
         with self.get_cursor() as cursor:
             cursor.execute(
-                "INSERT INTO trades (timestamp, signal_id, direction, entry_price, "
-                "polymarket_odds, fill_time, trade_size) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (timestamp, signal_id, direction, entry_price, polymarket_odds, 
-                 fill_time, trade_size),
+                "INSERT INTO trades "
+                "(timestamp, signal_id, direction, entry_price, polymarket_odds, "
+                "fill_time, trade_size, order_id, market_id, token_id, "
+                "is_simulated, is_premium, created_at, signal_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    timestamp, signal_id, direction, entry_price, polymarket_odds,
+                    fill_time, trade_size, order_id, market_id, token_id,
+                    int(is_simulated), int(is_premium), created_at, signal_json,
+                ),
             )
             return cursor.lastrowid
 
+    def record_trade(
+        self,
+        direction: str,
+        trade_size: float,
+        entry_price: Optional[float] = None,
+        order_id: Optional[str] = None,
+        market_id: Optional[str] = None,
+        token_id: Optional[str] = None,
+        signal: Optional[Dict[str, Any]] = None,
+        is_simulated: bool = True,
+        is_premium: bool = False,
+    ) -> int:
+        """High-level method: record a newly placed trade and return its DB trade ID.
+
+        Inserts a signal record first (to satisfy FK), then inserts the trade row
+        with all Polymarket order metadata.
+
+        Args:
+            direction: 'UP' or 'DOWN'.
+            trade_size: Trade size in USD.
+            entry_price: Polymarket fill price (0-1 odds).
+            order_id: Polymarket order ID string.
+            market_id: Polymarket market ID string.
+            token_id: Polymarket token ID string.
+            signal: Full signal dict (from EnsembleSignal.to_dict() + extras).
+            is_simulated: True if paper trading.
+            is_premium: True if signal met premium criteria.
+
+        Returns:
+            The new trade's database ID.
+        """
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        sig = signal or {}
+        confidence = float(sig.get("confidence", 0.0))
+        models = sig.get("models", {})
+        regime = str(sig.get("regime", "unknown"))
+        filters = sig.get("filter_result", {})
+
+        # Insert signal record first
+        signal_id = self.insert_signal(
+            timestamp=now_ms,
+            direction=direction,
+            confidence=confidence,
+            models=models,
+            regime=regime,
+            filters=filters,
+            traded=True,
+        )
+
+        # Insert trade record
+        trade_id = self.insert_trade(
+            timestamp=now_ms,
+            signal_id=signal_id,
+            direction=direction,
+            entry_price=entry_price,
+            trade_size=trade_size,
+            order_id=order_id,
+            market_id=market_id,
+            token_id=token_id,
+            is_simulated=is_simulated,
+            is_premium=is_premium,
+            created_at=now_iso,
+            signal_json=json.dumps(sig) if sig else None,
+        )
+
+        logger.info(
+            "record_trade: trade #%d (signal #%d) | %s $%.2f @ %s (%s)",
+            trade_id, signal_id, direction, trade_size, entry_price,
+            "SIM" if is_simulated else "LIVE",
+        )
+        return trade_id
+
+    def settle_trade(
+        self,
+        trade_id: int,
+        outcome: str,
+        pnl: float,
+        settlement_data: Optional[Dict[str, Any]] = None,
+    ):
+        """High-level method: record a trade settlement result.
+
+        Updates the trade row with settlement outcome and PnL, and also
+        updates the linked signal's outcome field.
+
+        Args:
+            trade_id: Trade DB ID.
+            outcome: 'WIN' or 'LOSS'.
+            pnl: Actual PnL amount (positive for win, negative for loss).
+            settlement_data: Full settlement dict (unused, reserved for future).
+        """
+        self.update_trade_settlement(trade_id=trade_id, settlement=outcome, pnl=pnl)
+
+        # Also update the linked signal's outcome
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "SELECT signal_id FROM trades WHERE id = ?", (trade_id,)
+            )
+            row = cursor.fetchone()
+            if row and row[0]:
+                self.update_signal_outcome(signal_id=row[0], outcome=outcome)
+
+        logger.info("settle_trade: trade #%d -> %s PnL=%+.2f", trade_id, outcome, pnl)
+
     def update_trade_settlement(self, trade_id: int, settlement: str, pnl: float):
         """Update a trade with settlement result.
-        
+
         Args:
             trade_id: Trade ID.
             settlement: 'WIN' or 'LOSS'.
@@ -570,10 +716,10 @@ class Database:
 
     def get_recent_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Get recent trades.
-        
+
         Args:
             limit: Maximum number of trades.
-        
+
         Returns:
             List of trade dicts sorted by timestamp ascending.
         """
@@ -586,7 +732,7 @@ class Database:
 
     def get_unsettled_trades(self) -> List[Dict[str, Any]]:
         """Get trades that haven't been settled yet.
-        
+
         Returns:
             List of unsettled trade dicts.
         """
@@ -598,7 +744,7 @@ class Database:
 
     def get_trades_today(self) -> List[Dict[str, Any]]:
         """Get all trades from today (UTC).
-        
+
         Returns:
             List of today's trade dicts.
         """
@@ -615,7 +761,7 @@ class Database:
 
     def get_trade_stats_today(self) -> Dict[str, Any]:
         """Get aggregated trading stats for today.
-        
+
         Returns:
             Dict with wins, losses, total, accuracy, pnl.
         """
@@ -638,7 +784,7 @@ class Database:
 
     def get_consecutive_losses(self) -> int:
         """Get the current consecutive loss streak.
-        
+
         Returns:
             Number of consecutive losses (0 if last trade was a win).
         """
@@ -657,10 +803,10 @@ class Database:
 
     def get_rolling_accuracy(self, n_trades: int = 50) -> Optional[float]:
         """Get accuracy over the last N settled trades.
-        
+
         Args:
             n_trades: Number of trades to consider.
-        
+
         Returns:
             Accuracy as a ratio (0-1), or None if insufficient trades.
         """
@@ -689,8 +835,8 @@ class Database:
         """Return the most recent settled trades ordered by timestamp desc."""
         with self.get_cursor() as cursor:
             cursor.execute(
-                """SELECT * FROM trades WHERE settlement IS NOT NULL
-                   ORDER BY timestamp DESC LIMIT ?""",
+                "SELECT * FROM trades WHERE settlement IS NOT NULL "
+                "ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             )
             rows = cursor.fetchall()
@@ -702,7 +848,7 @@ class Database:
                              accuracy: Optional[float] = None,
                              features: Optional[List[str]] = None):
         """Record a model version.
-        
+
         Args:
             timestamp: Training timestamp in milliseconds.
             model_name: Model name ('lgbm', 'tcn', 'logreg', 'meta', 'hmm').
@@ -712,18 +858,21 @@ class Database:
         """
         with self.get_cursor() as cursor:
             cursor.execute(
-                "INSERT INTO model_versions (timestamp, model_name, version, accuracy, features_json) "
+                "INSERT INTO model_versions "
+                "(timestamp, model_name, version, accuracy, features_json) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (timestamp, model_name, version, accuracy,
-                 json.dumps(features) if features else None),
+                (
+                    timestamp, model_name, version, accuracy,
+                    json.dumps(features) if features else None,
+                ),
             )
 
     def get_latest_model_version(self, model_name: str) -> Optional[Dict[str, Any]]:
         """Get the latest version record for a model.
-        
+
         Args:
             model_name: Model name.
-        
+
         Returns:
             Model version dict or None.
         """
@@ -747,9 +896,10 @@ class Database:
     # ==================== SESSION STATS OPERATIONS ====================
 
     def update_session_stats(self, date: str, trades_count: int, wins: int,
-                             losses: int, skips: int, pnl: float, accuracy: float):
+                             losses: int, skips: int, pnl: float,
+                             accuracy: float):
         """Insert or update daily session stats.
-        
+
         Args:
             date: Date string 'YYYY-MM-DD'.
             trades_count: Total trades placed.
@@ -769,10 +919,10 @@ class Database:
 
     def get_session_stats(self, days: int = 7) -> List[Dict[str, Any]]:
         """Get session stats for the last N days.
-        
+
         Args:
             days: Number of days to retrieve.
-        
+
         Returns:
             List of daily stats dicts.
         """
@@ -787,7 +937,7 @@ class Database:
 
     def get_db_stats(self) -> Dict[str, int]:
         """Get record counts for all tables.
-        
+
         Returns:
             Dict mapping table name to record count.
         """
@@ -805,11 +955,10 @@ class Database:
 
     def get_db_size_mb(self) -> float:
         """Get database file size in megabytes.
-        
+
         Returns:
             File size in MB.
         """
-        import os
         try:
             size_bytes = os.path.getsize(self.db_path)
             return size_bytes / (1024 * 1024)
@@ -818,7 +967,7 @@ class Database:
 
     def cleanup_old_data(self, candle_days: int = 30, orderbook_days: int = 7):
         """Clean up old data to manage storage.
-        
+
         Args:
             candle_days: Days of candle data to retain.
             orderbook_days: Days of orderbook data to retain.
@@ -832,11 +981,15 @@ class Database:
 
         with self.get_cursor() as cursor:
             for table in ("candles_5m", "candles_15m", "candles_1h"):
-                cursor.execute(f"DELETE FROM {table} WHERE timestamp < ?", (candle_cutoff,))
+                cursor.execute(
+                    f"DELETE FROM {table} WHERE timestamp < ?", (candle_cutoff,)
+                )
                 if cursor.rowcount > 0:
                     logger.info(f"Cleaned {cursor.rowcount} old records from {table}.")
 
-            cursor.execute("DELETE FROM orderbook_snapshots WHERE timestamp < ?", (ob_cutoff,))
+            cursor.execute(
+                "DELETE FROM orderbook_snapshots WHERE timestamp < ?", (ob_cutoff,)
+            )
             if cursor.rowcount > 0:
                 logger.info(f"Cleaned {cursor.rowcount} old orderbook snapshots.")
 
