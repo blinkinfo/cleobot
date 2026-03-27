@@ -807,9 +807,9 @@ MEXC_API_KEY=                   # MEXC API key
 MEXC_SECRET_KEY=                # MEXC API secret
 
 # Polymarket
-POLYMARKET_API_KEY=             # Polymarket API key
-POLYMARKET_API_SECRET=          # Polymarket API secret
-POLYMARKET_API_PASSPHRASE=      # Polymarket API passphrase
+POLYMARKET_PRIVATE_KEY=         # Ethereum private key (hex, with or without 0x prefix)
+POLYMARKET_FUNDER_ADDRESS=      # Polymarket funder/proxy wallet address
+POLYMARKET_SIGNATURE_TYPE=2     # 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE (default: 2)
 
 # Trading
 AUTO_TRADE_ENABLED=true         # Start with auto-trading on/off

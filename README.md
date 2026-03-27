@@ -46,9 +46,9 @@ cp .env.example .env
 | `TELEGRAM_CHAT_ID` | Yes | Your Telegram chat/channel ID |
 | `MEXC_API_KEY` | No | MEXC API key (for WebSocket auth; public data works without) |
 | `MEXC_SECRET_KEY` | No | MEXC secret key |
-| `POLYMARKET_API_KEY` | Yes (for live) | Polymarket CLOB API key |
-| `POLYMARKET_API_SECRET` | Yes (for live) | Polymarket API secret |
-| `POLYMARKET_API_PASSPHRASE` | Yes (for live) | Polymarket API passphrase |
+| `POLYMARKET_PRIVATE_KEY` | Yes (for live) | Ethereum private key for wallet-based auth (hex, with or without 0x prefix) |
+| `POLYMARKET_FUNDER_ADDRESS` | Yes (for live) | Polymarket funder/proxy wallet address |
+| `POLYMARKET_SIGNATURE_TYPE` | No | CLOB signature type: 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE (default: `2`) |
 | `AUTO_TRADE_ENABLED` | No | `true` to enable live trading (default: `false`) |
 | `BASE_TRADE_SIZE` | No | Trade size in USD (default: `1.0`) |
 | `MAX_TRADE_SIZE` | No | Maximum trade size (default: `3.0`) |
