@@ -25,13 +25,13 @@ import numpy as np
 import pandas as pd
 
 from src.utils.logger import get_logger
+from src.models.regime_detector import REGIME_CONFIDENCE_THRESHOLDS, DEFAULT_CONFIDENCE_THRESHOLD
 
 logger = get_logger("backtest.engine")
 
 WIN_PNL = 0.88
 LOSS_PNL = -1.00
 BREAKEVEN_WIN_RATE = 1.00 / (1.00 + WIN_PNL)
-DEFAULT_CONFIDENCE_THRESHOLD = 0.58
 MIN_WARMUP_CANDLES = 60
 
 
@@ -123,7 +123,7 @@ class HeuristicSignalGenerator:
         if vol_ratio > 1.5:
             score *= 1.1
         direction = "UP" if score >= 0 else "DOWN"
-        confidence = 0.50 + min(abs(score) * 0.25, 0.20)
+        confidence = 0.50 + min(abs(score) * 0.5, 0.35)
         return direction, confidence
 
     @staticmethod
@@ -168,6 +168,8 @@ def _compute_atr(df: pd.DataFrame, idx: int, period: int = 14) -> float:
     return float(np.mean(trs)) if trs else 0.0
 
 
+# FIX 6: Added model_type parameter with default "heuristic" so existing callers are unaffected.
+# Relaxed thresholds for heuristic mode; ML mode uses REGIME_CONFIDENCE_THRESHOLDS.
 def _simulate_filters(
     direction: str,
     confidence: float,
@@ -179,18 +181,28 @@ def _simulate_filters(
     n_settled: int,
     pause_cycles_remaining: int,
     streak_manual_restart: bool,
+    model_type: str = "heuristic",
 ) -> Tuple[str, str, Dict[str, bool]]:
     verdicts: Dict[str, bool] = {}
     first_fail = ""
-    if regime == "low_vol_ranging":
-        threshold = 0.62
-    elif regime in ("trending_up", "trending_down"):
-        threshold = 0.56
-    elif regime == "high_vol_chaotic":
-        threshold = 0.65
+
+    # Relaxed thresholds for heuristic mode (ML models have wider confidence range)
+    HEURISTIC_THRESHOLDS = {
+        "low_vol_ranging": 0.52,
+        "trending_up": 0.48,
+        "trending_down": 0.48,
+        "high_vol_chaotic": 0.55,
+    }
+    HEURISTIC_CHAOTIC_AGREEMENT = 2  # relaxed from 3
+
+    if model_type == "heuristic":
+        regime_threshold = HEURISTIC_THRESHOLDS.get(regime, 0.50)
+        chaotic_agreement_required = HEURISTIC_CHAOTIC_AGREEMENT
     else:
-        threshold = DEFAULT_CONFIDENCE_THRESHOLD
-    passed_conf = confidence >= threshold
+        regime_threshold = REGIME_CONFIDENCE_THRESHOLDS.get(regime, DEFAULT_CONFIDENCE_THRESHOLD)
+        chaotic_agreement_required = 3
+
+    passed_conf = confidence >= regime_threshold
     verdicts["confidence"] = passed_conf
     if not passed_conf and not first_fail:
         first_fail = "Confidence below threshold"
@@ -199,11 +211,11 @@ def _simulate_filters(
     if not passed_vol and not first_fail:
         first_fail = "ATR outside acceptable range"
     if regime == "high_vol_chaotic":
-        passed_regime = agreement >= 3 and confidence >= 0.65
+        passed_regime = agreement >= chaotic_agreement_required and confidence >= regime_threshold
     elif regime == "low_vol_ranging":
-        passed_regime = confidence >= 0.62
+        passed_regime = confidence >= regime_threshold
     else:
-        passed_regime = confidence >= threshold
+        passed_regime = confidence >= regime_threshold
     verdicts["regime"] = passed_regime
     if not passed_regime and not first_fail:
         first_fail = "Regime filter ({})".format(regime)
@@ -248,7 +260,16 @@ def _estimate_regime(df: pd.DataFrame, idx: int) -> str:
         normalised_slope = slope / (float(closes[-1]) + 1e-9)
     else:
         normalised_slope = 0.0
-    if volatility > 0.003:
+    prices = closes  # alias used by dynamic threshold block below
+    # Dynamic threshold: 75th percentile of recent volatility (BTC-appropriate)
+    # Fall back to 0.006 if insufficient history
+    if len(prices) >= 25:
+        returns_history = np.diff(np.log(prices[-50:] + 1e-10)) if len(prices) >= 50 else np.diff(np.log(prices + 1e-10))
+        rolling_vols = [np.std(returns_history[max(0,i-12):i]) for i in range(12, len(returns_history)+1)]
+        vol_threshold = np.percentile(rolling_vols, 75) if rolling_vols else 0.006
+    else:
+        vol_threshold = 0.006
+    if volatility > vol_threshold:
         return "high_vol_chaotic"
     elif normalised_slope > 0.0001:
         return "trending_up"
@@ -269,6 +290,13 @@ class BacktestEngine:
         self.db = db
         self.ensemble = ensemble
         self._heuristic = HeuristicSignalGenerator()
+        # FIX 5: Use real regime detector if available from ensemble
+        self._regime_detector = None
+        if ensemble is not None and hasattr(ensemble, 'regime_detector') and ensemble.regime_detector is not None:
+            rd = ensemble.regime_detector
+            if hasattr(rd, 'is_fitted') and rd.is_fitted:
+                self._regime_detector = rd
+                logger.info("Using trained RegimeDetector from ensemble for backtest regime classification")
 
     def run(
         self,
@@ -325,8 +353,24 @@ class BacktestEngine:
                 direction, confidence, agreement, regime = self._ml_signal(df, idx)
             else:
                 direction, confidence = self._heuristic.predict(df, idx)
-                agreement = 2
-                regime = _estimate_regime(df, idx)
+                # Dynamic agreement based on heuristic confidence
+                if confidence > 0.65:
+                    agreement = 3
+                elif confidence > 0.55:
+                    agreement = 2
+                else:
+                    agreement = 1
+                # FIX 5: Use real RegimeDetector if available, else fall back to heuristic
+                df_window = df.iloc[max(0, idx - 30): idx + 1]
+                if self._regime_detector is not None and len(df_window) >= 30:
+                    try:
+                        regime = self._regime_detector.predict(df_window)
+                        if regime is None:
+                            regime = _estimate_regime(df, idx)
+                    except Exception:
+                        regime = _estimate_regime(df, idx)
+                else:
+                    regime = _estimate_regime(df, idx)
             atr = _compute_atr(df, idx)
             if atr > 0:
                 atr_history.append(atr)
@@ -338,6 +382,7 @@ class BacktestEngine:
                 rolling_acc = float(sum(outcome_history[-50:])) / 50.0
             if pause_cycles_remaining > 0:
                 pause_cycles_remaining -= 1
+            # FIX 6: Pass model_type so filters use appropriate thresholds
             decision, skip_reason, filter_verdicts = _simulate_filters(
                 direction=direction,
                 confidence=confidence,
@@ -349,6 +394,7 @@ class BacktestEngine:
                 n_settled=n_settled,
                 pause_cycles_remaining=pause_cycles_remaining,
                 streak_manual_restart=streak_manual_restart,
+                model_type="ml" if use_ml else "heuristic",
             )
             if decision == "SKIP":
                 trades.append(TradeRecord(

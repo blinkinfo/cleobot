@@ -33,6 +33,22 @@ from src.utils.logger import get_logger
 
 logger = get_logger("models.ensemble")
 
+def _align_features_to_training(
+    features: Dict[str, Any],
+    training_feature_names: List[str],
+) -> Dict[str, Any]:
+    """Align a feature dict to the training feature set.
+
+    - Features not in the training set are dropped (avoids mismatch errors).
+    - Features in training set but missing from inference are filled with 0.0.
+    This ensures models receive exactly the features they were trained on.
+    """
+    aligned = {}
+    for name in training_feature_names:
+        aligned[name] = features.get(name, 0.0)
+    return aligned
+
+
 # Active versions file
 ACTIVE_VERSIONS_FILE = "active_versions.json"
 
@@ -130,6 +146,9 @@ class Ensemble:
         self._prediction_count: int = 0
         self._total_inference_ms: float = 0.0
 
+        # Training feature names for inference-time alignment (set by Trainer after training)
+        self._training_feature_names: Optional[List[str]] = None
+
         # (Rate-limiter removed -- the scheduler already ensures 5-min spacing
         # between cycles, so caching stale signals caused more harm than good.)
 
@@ -168,6 +187,9 @@ class Ensemble:
             return self._neutral_signal(0.0)
 
         # --- Layer 1: Base model predictions --- #
+        # Align features to training set if training feature names are known
+        if self._training_feature_names is not None:
+            features = _align_features_to_training(features, self._training_feature_names)
         features_df = pd.DataFrame([features])
 
         # LightGBM: single-row prediction
@@ -285,6 +307,15 @@ class Ensemble:
                 logger.warning(f"Model file not found: {path}")
                 success = False
 
+        # Load training feature names for inference alignment
+        feature_names_path = os.path.join(self.models_dir, "training_feature_names.json")
+        if os.path.exists(feature_names_path):
+            with open(feature_names_path, "r") as f:
+                self._training_feature_names = json.load(f)
+            logger.info(f"Loaded {len(self._training_feature_names)} training feature names")
+        else:
+            self._training_feature_names = None
+
         if self.is_ready:
             logger.info("All ensemble models loaded successfully.")
         else:
@@ -308,6 +339,14 @@ class Ensemble:
                 self.active_versions[name] = version
 
         self._save_active_versions()
+
+        # Save training feature names for inference alignment
+        if self._training_feature_names is not None:
+            feature_names_path = os.path.join(self.models_dir, "training_feature_names.json")
+            with open(feature_names_path, "w") as f:
+                json.dump(self._training_feature_names, f)
+            logger.info(f"Saved {len(self._training_feature_names)} training feature names")
+
         self._cleanup_old_versions()
         logger.info(f"All models saved. Active versions: {self.active_versions}")
 

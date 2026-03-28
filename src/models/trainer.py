@@ -56,6 +56,29 @@ SMOTE_MIN_SAMPLES = 50       # Minimum samples for SMOTE
 EMERGENCY_DECAY_HALFLIFE = 3 # Days for exponential decay (emergency retrain)
 
 
+
+# Features that rely on in-memory/live data and are expected to be zero/constant
+# in historical training data. These are excluded from model training but remain
+# available at inference time through the live feature engine.
+LIVE_ONLY_FEATURES = frozenset([
+    # Orderbook features (require live WebSocket snapshots)
+    "ob_imbalance_5", "ob_imbalance_10", "ob_imbalance_20",
+    "ob_net_pressure", "ob_imbalance_change_30s", "ob_imbalance_change_60s",
+    "ob_spread_abs", "ob_spread_pct", "ob_spread_z",
+    "ob_depth_bid_1", "ob_depth_ask_1", "ob_depth_ratio_1",
+    "ob_depth_bid_5", "ob_depth_ask_5", "ob_depth_ratio_5",
+    "ob_depth_bid_10", "ob_depth_ask_10", "ob_depth_ratio_10",
+    "ob_bid_wall_strength", "ob_ask_wall_strength",
+    "ob_micro_pressure", "ob_absorption_ratio",
+    # Polymarket features (require live API/in-memory data)
+    "pm_up_price", "pm_down_price", "pm_volume_24h", "pm_spread",
+    "pm_model_divergence", "pm_momentum_1h", "pm_momentum_6h",
+    "pm_up_price_z", "pm_volume_z", "pm_divergence_z",
+    # Derived features that depend on orderbook or polymarket
+    "derived_ob_vol_interaction", "derived_breakout_signal",
+    "derived_rsi_divergence",
+])
+
 class Trainer:
     """Manages all training operations for the CleoBot ensemble.
 
@@ -446,8 +469,28 @@ class Trainer:
         nunique = combined_df.nunique()
         constant_cols = nunique[nunique <= 1].index.tolist()
         if constant_cols:
-            logger.info(f"Dropping {len(constant_cols)} constant columns: {constant_cols[:10]}...")
+            # Separate live-only features (expected to be zero in historical data)
+            # from genuinely useless features
+            live_only_dropped = [c for c in constant_cols if c in LIVE_ONLY_FEATURES]
+            genuinely_constant = [c for c in constant_cols if c not in LIVE_ONLY_FEATURES]
+            if live_only_dropped:
+                logger.info(
+                    f"Excluding {len(live_only_dropped)} live-only features from training "
+                    f"(no historical data, but available at inference): {live_only_dropped}"
+                )
+            if genuinely_constant:
+                logger.warning(
+                    f"Dropping {len(genuinely_constant)} genuinely constant columns "
+                    f"(no signal): {genuinely_constant}"
+                )
             combined_df = combined_df.drop(columns=constant_cols)
+
+        # Store training feature names for inference-time alignment
+        self._training_feature_names = [
+            c for c in combined_df.columns
+            if c not in ("label", "_timestamp", "timestamp", "target")
+        ]
+        logger.info(f"Training feature set: {len(self._training_feature_names)} features")
 
         # --- 9. Add labels and timestamps ---
         combined_df["label"] = df.iloc[start_idx:]["label"].reset_index(drop=True)
@@ -847,6 +890,10 @@ class Trainer:
 
                 # Save
                 self.ensemble.save_models()
+
+                # Propagate training feature names to ensemble for inference alignment
+                if hasattr(self, '_training_feature_names') and self._training_feature_names:
+                    self.ensemble._training_feature_names = self._training_feature_names
 
                 # Record versions in DB
                 now_ms = utc_timestamp_ms()
