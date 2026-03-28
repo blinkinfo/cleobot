@@ -623,6 +623,7 @@ class Trainer:
         val_days: int = VALIDATION_DAYS,
         step_days: int = 1,
         purge_candles: int = PURGE_CANDLES,
+        max_splits: Optional[int] = None,
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """Generate walk-forward train/validation splits.
 
@@ -660,6 +661,9 @@ class Trainer:
             f"Walk-forward CV: {len(splits)} splits "
             f"(train={train_size}, val={val_size}, purge={purge_candles})"
         )
+        if max_splits is not None and len(splits) > max_splits:
+            splits = splits[-max_splits:]  # Keep the most recent splits
+            logger.info(f"Truncated to {max_splits} most recent splits (max_splits={max_splits}).")
         return splits
 
     # ================================================================== #

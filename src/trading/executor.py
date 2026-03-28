@@ -702,10 +702,10 @@ class TradingExecutor:
                 feature_engine=self.feature_engine,
             )
 
-            df_5m = self._get_df_5m()
-            if len(df_5m) < 500:
+            candle_count = len(self.db.get_candles("candles_5m", limit=500))
+            if candle_count < 500:
                 logger.warning(
-                    f"Insufficient training data: {len(df_5m)} candles (need 500+). "
+                    f"Insufficient training data: {candle_count} candles (need 500+). "
                     "Skipping retrain."
                 )
                 return
