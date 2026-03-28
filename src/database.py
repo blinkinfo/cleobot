@@ -199,13 +199,19 @@ class Database:
                     pnl REAL NOT NULL DEFAULT 0.0,
                     accuracy REAL NOT NULL DEFAULT 0.0
                 )
+            """)
+
+            # Feature snapshots for restart recovery
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS feature_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp_ms INTEGER NOT NULL,
                     features_json TEXT NOT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE INDEX IF NOT EXISTS idx_feature_snapshots_ts ON feature_snapshots (timestamp_ms);
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_feature_snapshots_ts ON feature_snapshots (timestamp_ms)
             """)
 
         logger.info("Database initialized -- all tables created.")
