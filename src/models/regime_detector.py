@@ -45,16 +45,17 @@ REGIME_DISPLAY = {
     "high_vol_chaotic": "High-Vol Chaotic",
 }
 
-# Regime-specific confidence thresholds (from Section 7.3)
+# Regime-specific confidence thresholds — calibrated for sigmoid-scaled confidence
+# (sigmoid maps prob 0.55 -> conf ~0.50, prob 0.60 -> conf ~0.73)
 REGIME_CONFIDENCE_THRESHOLDS = {
-    "low_vol_ranging": 0.62,
-    "trending_up": 0.56,
-    "trending_down": 0.56,
-    "high_vol_chaotic": 0.65,
+    "low_vol_ranging": 0.35,
+    "trending_up": 0.25,
+    "trending_down": 0.25,
+    "high_vol_chaotic": 0.45,
 }
 
 # Default confidence threshold
-DEFAULT_CONFIDENCE_THRESHOLD = 0.58
+DEFAULT_CONFIDENCE_THRESHOLD = 0.30
 
 # Number of HMM states
 N_REGIMES = 4

@@ -269,6 +269,22 @@ class MetaLearner:
             return self.calibrator.predict(raw_probas)
         return raw_probas
 
+    @staticmethod
+    def _confidence_from_proba(proba: float) -> float:
+        """Convert a raw probability to a calibrated confidence score.
+
+        Uses a sigmoid centered at prob=0.55 so the realistic model output
+        range (0.50-0.65) maps meaningfully to the 0.0-1.0 confidence range.
+
+        Examples:
+            proba=0.50 -> confidence ~0.00
+            proba=0.55 -> confidence ~0.50
+            proba=0.60 -> confidence ~0.73
+            proba=0.65 -> confidence ~0.88
+        """
+        import math
+        return 1.0 / (1.0 + math.exp(-12.0 * (abs(proba - 0.5) - 0.05)))
+
     def predict_single(
         self,
         lgbm_proba: float,
@@ -300,7 +316,7 @@ class MetaLearner:
         df = pd.DataFrame([meta_feats])
         proba = float(self.predict_proba(df, calibrated=calibrated)[0])
         direction = "UP" if proba > 0.5 else "DOWN"
-        confidence = abs(proba - 0.5) * 2
+        confidence = MetaLearner._confidence_from_proba(proba)
         return {
             "direction": direction,
             "probability": proba,

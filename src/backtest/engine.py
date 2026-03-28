@@ -182,6 +182,7 @@ def _simulate_filters(
     pause_cycles_remaining: int,
     streak_manual_restart: bool,
     model_type: str = "heuristic",
+    confidence_history: list = None,
 ) -> Tuple[str, str, Dict[str, bool]]:
     verdicts: Dict[str, bool] = {}
     first_fail = ""
@@ -243,6 +244,18 @@ def _simulate_filters(
     else:
         passed_corr = True
     verdicts["correlation"] = passed_corr
+    # Filter: min_signal_quality — only pass top 30% of signals by confidence (rolling 500-candle window)
+    if model_type == "ml":
+        if confidence_history is None:
+            confidence_history = []
+        if len(confidence_history) >= 50:
+            percentile_70 = float(np.percentile(confidence_history, 70))
+            passed_quality = confidence >= percentile_70
+        else:
+            passed_quality = True  # warmup: pass all signals
+        verdicts["min_signal_quality"] = passed_quality
+        if not passed_quality and not first_fail:
+            first_fail = "Signal quality below 70th percentile"
     decision = "SKIP" if first_fail else "TRADE"
     return decision, first_fail, verdicts
 
@@ -341,6 +354,7 @@ class BacktestEngine:
         streak_manual_restart = False
         atr_history: List[float] = []
         outcome_history: List[int] = []
+        confidence_history: list = []  # rolling window of ML confidence scores for percentile gating
         for idx in range(MIN_WARMUP_CANDLES, len(df) - 1):
             if not in_range.iloc[idx]:
                 atr = _compute_atr(df, idx)
@@ -382,6 +396,11 @@ class BacktestEngine:
                 rolling_acc = float(sum(outcome_history[-50:])) / 50.0
             if pause_cycles_remaining > 0:
                 pause_cycles_remaining -= 1
+            # Track confidence for rolling percentile gate
+            if use_ml:
+                confidence_history.append(confidence)
+                if len(confidence_history) > 500:
+                    confidence_history.pop(0)
             # FIX 6: Pass model_type so filters use appropriate thresholds
             decision, skip_reason, filter_verdicts = _simulate_filters(
                 direction=direction,
@@ -395,6 +414,7 @@ class BacktestEngine:
                 pause_cycles_remaining=pause_cycles_remaining,
                 streak_manual_restart=streak_manual_restart,
                 model_type="ml" if use_ml else "heuristic",
+                confidence_history=confidence_history,
             )
             if decision == "SKIP":
                 trades.append(TradeRecord(
@@ -601,7 +621,7 @@ class BacktestEngine:
 
     @staticmethod
     def _filter_impact_analysis(all_trades: List[TradeRecord]) -> List[FilterImpact]:
-        filter_names = ["confidence", "volatility", "regime", "agreement", "streak", "correlation"]
+        filter_names = ["confidence", "volatility", "regime", "agreement", "streak", "correlation", "min_signal_quality"]
         passed_all = [t for t in all_trades if not t.was_skipped]
         n_passed = len(passed_all)
         acc_with = sum(1 for t in passed_all if t.won) / n_passed if n_passed > 0 else 0.0
