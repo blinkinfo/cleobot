@@ -219,10 +219,11 @@ class RegimeDetector:
         self.state_to_regime: Dict[int, str] = {}
         self.version: int = 0
         self._is_trained: bool = False
+        self._use_rule_based: bool = False
 
     @property
     def is_trained(self) -> bool:
-        return self._is_trained and self.hmm is not None
+        return self._is_trained and (self.hmm is not None or self._use_rule_based)
 
     def train(self, df_5m: pd.DataFrame) -> Dict[str, Any]:
         """Train the HMM regime detector.
@@ -267,6 +268,7 @@ class RegimeDetector:
         self._assign_regime_labels(regime_feats, states)
 
         self._is_trained = True
+        self._use_rule_based = False  # HMM trained successfully
 
         # Compute regime distribution
         regime_counts = {}
@@ -288,6 +290,45 @@ class RegimeDetector:
         logger.info(f"HMM trained: {regime_pcts}")
         return metrics
 
+    def _rule_based_predict(self, df_5m: pd.DataFrame) -> Dict[str, Any]:
+        """Rule-based regime prediction used when HMM is not available."""
+        default = {
+            "regime": "low_vol_ranging",
+            "display": "Low-Vol Ranging",
+            "confidence": 0.5,
+            "probabilities": {r: 0.25 for r in REGIME_LABELS.values()},
+        }
+        regime_feats = compute_regime_features(df_5m)
+        if len(regime_feats) == 0:
+            return default
+        last = regime_feats.iloc[-1]
+        volatility = float(last.get("regime_volatility", 0.0))
+        trend = float(last.get("regime_trend", 0.0))
+        adx = float(last.get("regime_adx", 25.0))
+        vol_75th = float(regime_feats["regime_volatility"].quantile(0.75))
+        if adx > 25 and trend > 0:
+            regime = "trending_up"
+            confidence = min(0.5 + adx / 200.0, 0.85)
+        elif adx > 25 and trend < 0:
+            regime = "trending_down"
+            confidence = min(0.5 + adx / 200.0, 0.85)
+        elif volatility > vol_75th:
+            regime = "high_vol_chaotic"
+            confidence = min(0.5 + (volatility - vol_75th) / max(vol_75th, 1e-8) * 0.3, 0.80)
+        else:
+            regime = "low_vol_ranging"
+            confidence = 0.65
+        n_others = len(REGIME_LABELS) - 1
+        other_prob = (1.0 - confidence) / max(n_others, 1)
+        probs = {r: other_prob for r in REGIME_LABELS.values()}
+        probs[regime] = confidence
+        return {
+            "regime": regime,
+            "display": REGIME_DISPLAY.get(regime, regime),
+            "confidence": confidence,
+            "probabilities": probs,
+        }
+
     def predict(self, df_5m: pd.DataFrame) -> str:
         """Predict the current market regime.
 
@@ -297,6 +338,8 @@ class RegimeDetector:
         Returns:
             Regime label string.
         """
+        if self._use_rule_based:
+            return self._rule_based_predict(df_5m)["regime"]
         if not self.is_trained:
             return "low_vol_ranging"
 
@@ -318,6 +361,8 @@ class RegimeDetector:
         Returns:
             Dict with 'regime', 'confidence', 'probabilities'.
         """
+        if self._use_rule_based:
+            return self._rule_based_predict(df_5m)
         if not self.is_trained:
             return {
                 "regime": "low_vol_ranging",
@@ -511,17 +556,7 @@ class RegimeDetector:
     def _setup_default_regimes(self):
         """Set up default regime assignments when training data is insufficient."""
         self.state_to_regime = dict(REGIME_LABELS)
-        # Create a minimal HMM for prediction
-        self.hmm = GaussianHMM(
-            n_components=self.n_regimes,
-            covariance_type="full",
-            n_iter=1,
-            random_state=42,
-        )
-        self.scaler = StandardScaler()
-        # Fit with dummy data so predict() works
-        dummy = np.random.randn(100, 5)
-        self.scaler.fit(dummy)
-        self.hmm.fit(dummy)
+        # Use rule-based detection instead of fitting HMM on random noise
+        self._use_rule_based = True
         self._is_trained = True
-        logger.info("Using default regime assignments (insufficient training data).")
+        logger.info("Using rule-based regime detection (insufficient training data).")

@@ -211,6 +211,14 @@ class CleoBot:
         else:
             logger.info(f"Step 4/9: Data sufficient ({n_5m} 5m candles) -- no backfill needed")
 
+        # Ensure minimum candle count after backfill (safety net)
+        ok = await self.backfill.ensure_minimum_candles(min_5m=1000)
+        if not ok:
+            logger.warning(
+                "Step 4/9: WARNING -- could not reach 1000 5m candles after backfill. "
+                "Continuing with degraded data; training may use lightweight mode."
+            )
+
         # Restart recovery: track last processed candle
         self._last_candle_ts = self.db.get_latest_candle_timestamp("candles_5m")
         if self._last_candle_ts:
@@ -256,6 +264,10 @@ class CleoBot:
             f"Step 7/9: Trading executor built | "
             f"auto_trade={self.config.trading.auto_trade_enabled}"
         )
+
+        # Initialize executor: load feature history from DB + pre-populate ATR
+        await self.executor.initialize()
+        logger.info("Step 7/9: Executor initialized (feature history + ATR pre-populated from DB)")
 
         # Step 8: Telegram bot
         await self.telegram.start(

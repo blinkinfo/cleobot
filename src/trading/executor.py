@@ -573,11 +573,74 @@ class TradingExecutor:
     # FEATURE HISTORY (for TCN)
     # ---------------------------------------------------------------- #
 
+    def _load_feature_history_from_db(self) -> None:
+        """Pre-populate feature history from DB snapshots for restart recovery."""
+        import json as _json
+        try:
+            snapshots = self.db.get_feature_snapshots(limit=200)
+            if snapshots:
+                self._feature_history = list(snapshots)
+                if len(self._feature_history) > self._feature_history_maxlen:
+                    self._feature_history = self._feature_history[-self._feature_history_maxlen:]
+                logger.info(
+                    f"Loaded {len(self._feature_history)} feature snapshots from DB for restart recovery."
+                )
+                tcn_seq_length = 50
+                try:
+                    tcn_seq_length = self.ensemble.tcn_seq_length
+                except AttributeError:
+                    pass
+                if len(self._feature_history) >= tcn_seq_length:
+                    self._warmup_cycles_remaining = 0
+                    logger.info("Smart warmup: sufficient history loaded, skipping warmup cycles.")
+            else:
+                logger.info("No feature snapshots found in DB -- starting fresh.")
+        except Exception as e:
+            logger.warning(f"_load_feature_history_from_db: failed: {e}")
+
+    def _precompute_atr_history(self) -> None:
+        """Pre-populate ATR history for SignalFilter from DB candles on startup."""
+        try:
+            import numpy as np
+            rows = self.db.get_candles("candles_5m", limit=300)
+            if not rows or len(rows) < 14:
+                logger.info("_precompute_atr_history: insufficient candles -- skipping.")
+                return
+            highs  = [float(r["high"])  for r in rows]
+            lows   = [float(r["low"])   for r in rows]
+            closes = [float(r["close"]) for r in rows]
+            period = 12
+            atr_count = 0
+            for i in range(period, len(rows)):
+                h = np.array(highs[i - period:i + 1])
+                l = np.array(lows[i - period:i + 1])
+                c = np.array(closes[i - period:i + 1])
+                tr = np.maximum(h[1:] - l[1:], np.maximum(
+                    np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])
+                ))
+                atr = float(np.mean(tr))
+                self.signal_filter.add_atr_observation(atr)
+                atr_count += 1
+            logger.info(f"Pre-populated {atr_count} ATR observations from DB candles.")
+        except Exception as e:
+            logger.warning(f"_precompute_atr_history: failed: {e}")
+
+    async def initialize(self) -> None:
+        """Load persistent state from DB (called from main.py after executor is built)."""
+        self._load_feature_history_from_db()
+        self._precompute_atr_history()
+
     def _update_feature_history(self, features: Dict[str, float]):
         """Maintain rolling feature history for TCN sequence model."""
+        import json as _json, time as _time
+        timestamp_ms = int(_time.time() * 1000)
         self._feature_history.append(dict(features))
         if len(self._feature_history) > self._feature_history_maxlen:
             self._feature_history.pop(0)
+        try:
+            self.db.save_feature_snapshot(timestamp_ms, _json.dumps(features))
+        except Exception as e:
+            logger.debug(f"_update_feature_history: failed to save snapshot: {e}")
 
     def _get_feature_history_df(self):
         """Get feature history as a DataFrame for TCN."""

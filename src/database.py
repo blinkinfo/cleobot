@@ -199,6 +199,13 @@ class Database:
                     pnl REAL NOT NULL DEFAULT 0.0,
                     accuracy REAL NOT NULL DEFAULT 0.0
                 )
+                CREATE TABLE IF NOT EXISTS feature_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ms INTEGER NOT NULL,
+                    features_json TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_feature_snapshots_ts ON feature_snapshots (timestamp_ms);
             """)
 
         logger.info("Database initialized -- all tables created.")
@@ -992,6 +999,41 @@ class Database:
             )
             if cursor.rowcount > 0:
                 logger.info(f"Cleaned {cursor.rowcount} old orderbook snapshots.")
+
+        # Clean up old feature snapshots (keep 7 days)
+        cutoff_features_ms = int((datetime.now(timezone.utc) - timedelta(days=7)).timestamp() * 1000)
+        with self.get_cursor() as cursor:
+            cursor.execute("DELETE FROM feature_snapshots WHERE timestamp_ms < ?", (cutoff_features_ms,))
+            deleted = cursor.rowcount
+        logger.info(f"Cleaned up {deleted} old feature snapshots")
+
+    def save_feature_snapshot(self, timestamp_ms: int, features_json: str) -> None:
+        """Save a feature snapshot to the database for restart recovery."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO feature_snapshots (timestamp_ms, features_json) VALUES (?, ?)",
+                (timestamp_ms, features_json),
+            )
+        logger.debug(f"Saved feature snapshot at ts={timestamp_ms}")
+
+    def get_feature_snapshots(self, limit: int = 200) -> List[Dict]:
+        """Get recent feature snapshots for restart recovery, oldest first."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "SELECT timestamp_ms, features_json FROM feature_snapshots ORDER BY timestamp_ms DESC LIMIT ?",
+                (limit,),
+            )
+            rows = cursor.fetchall()
+        # Reverse to get oldest-first order for proper history reconstruction
+        result = []
+        for row in reversed(rows):
+            try:
+                features = json.loads(row["features_json"])
+                features["_snapshot_ts"] = row["timestamp_ms"]
+                result.append(features)
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Failed to parse feature snapshot: {e}")
+        return result
 
     def close(self):
         """Close the database connection."""

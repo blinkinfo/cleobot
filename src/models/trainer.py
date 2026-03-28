@@ -78,6 +78,7 @@ class Trainer:
         self._last_full_retrain: Optional[datetime] = None
         self._last_incremental: Optional[datetime] = None
         self._notification_callback: Optional[Callable] = None
+        self._is_lightweight: bool = False
 
     def set_notification_callback(self, callback: Callable):
         """Set a callback for training notifications (Telegram).
@@ -117,12 +118,22 @@ class Trainer:
         limit = days * CANDLES_PER_DAY + FEATURE_LOOKBACK_CANDLES
         candles = self.db.get_candles("candles_5m", limit=limit)
 
-        if len(candles) < CANDLES_PER_DAY * 3:
+        if len(candles) < 500:
             logger.warning(
                 f"Insufficient candle data: {len(candles)} rows "
-                f"(need {CANDLES_PER_DAY * 3}+)."
+                f"(need 500+). Aborting training."
             )
             return None
+
+        if len(candles) < CANDLES_PER_DAY * 3:
+            effective_days = max(3, len(candles) // CANDLES_PER_DAY)
+            logger.warning(
+                f"Limited candle data: {len(candles)} rows -- using lightweight training "
+                f"(effective_days={effective_days}). Ideal minimum is {CANDLES_PER_DAY * 3}."
+            )
+            self._is_lightweight = True
+        else:
+            self._is_lightweight = False
 
         df = pd.DataFrame(candles)
         for col in ("open", "high", "low", "close", "volume"):
@@ -692,8 +703,10 @@ class Trainer:
             X = data[feature_cols]
             y = label_col
 
-            # 2. Walk-forward CV splits
-            splits = self._walk_forward_split(len(X))
+            # 2. Walk-forward CV splits (reduce to 2 in lightweight mode)
+            if self._is_lightweight:
+                logger.info("Lightweight mode: using 2 walk-forward CV splits.")
+            splits = self._walk_forward_split(len(X), max_splits=2 if self._is_lightweight else None)
             if not splits:
                 self._notify("Full retrain ABORTED: no valid CV splits.")
                 return {"status": "aborted", "reason": "no_cv_splits"}
@@ -1266,7 +1279,10 @@ class Trainer:
             return np.mean(accuracies)
 
         study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=OPTUNA_TRIALS, show_progress_bar=False)
+        n_trials = 10 if self._is_lightweight else OPTUNA_TRIALS
+        if self._is_lightweight:
+            logger.info(f"Lightweight mode: reducing Optuna trials to {n_trials}.")
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
         best_params = param_space(study.best_trial)
         logger.info(

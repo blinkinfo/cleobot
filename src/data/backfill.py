@@ -213,6 +213,42 @@ class DataBackfill:
             logger.error(f"Funding rate backfill failed: {e}")
             return {"status": "error", "error": str(e)}
 
+    async def ensure_minimum_candles(self, min_5m: int = 1000) -> bool:
+        """Ensure the database has at least min_5m 5-minute candles.
+
+        If insufficient candles exist, triggers a forced backfill.
+
+        Args:
+            min_5m: Minimum required number of 5m candles.
+
+        Returns:
+            True if count >= min_5m after backfill, False otherwise.
+        """
+        count = self.db.get_candle_count("candles_5m")
+        if count >= min_5m:
+            logger.info(f"ensure_minimum_candles: {count} >= {min_5m} -- OK")
+            return True
+
+        days = max(TARGET_CANDLE_DAYS, (min_5m // 288) + 2)
+        logger.warning(
+            f"ensure_minimum_candles: only {count} candles (need {min_5m}). "
+            f"Forcing backfill for {days} days..."
+        )
+        await self.run_backfill(days=days)
+
+        count_after = self.db.get_candle_count("candles_5m")
+        if count_after >= min_5m:
+            logger.info(
+                f"ensure_minimum_candles: backfill successful -- {count_after} candles available."
+            )
+            return True
+        else:
+            logger.warning(
+                f"ensure_minimum_candles: backfill insufficient -- "
+                f"{count_after} candles (need {min_5m})."
+            )
+            return False
+
     async def check_data_health(self) -> dict:
         """Check the health of stored candle data.
         

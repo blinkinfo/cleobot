@@ -45,6 +45,7 @@ class DataCollector:
         self._running = False
         self._ws_task: Optional[asyncio.Task] = None
         self._orderbook_poll_task: Optional[asyncio.Task] = None
+        self._reconnect_fill_task: Optional[asyncio.Task] = None
 
         # Track latest data for feature engine access
         self._latest_orderbook: Optional[Dict[str, Any]] = None
@@ -124,10 +125,43 @@ class DataCollector:
 
         logger.info("Data collector stopped.")
 
+    async def _fill_reconnection_gap(self):
+        """Fill any candle gaps that occurred during a WebSocket disconnection."""
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        interval_config = [
+            ("5m",  "candles_5m",  5 * 60 * 1000),
+            ("15m", "candles_15m", 15 * 60 * 1000),
+            ("1h",  "candles_1h",  60 * 60 * 1000),
+        ]
+        for interval, table, interval_ms in interval_config:
+            try:
+                latest_ts = self.db.get_latest_candle_timestamp(table)
+                if not latest_ts:
+                    continue
+                gap = (now_ms - latest_ts) / interval_ms
+                if gap > 1:
+                    candles = await self.rest.get_klines_range(interval, latest_ts, now_ms)
+                    if candles:
+                        self.db.insert_candles_batch(table, candles)
+                        logger.info(
+                            f"Filled {len(candles)} missed {interval} candles after reconnection."
+                        )
+            except Exception as e:
+                logger.warning(f"_fill_reconnection_gap: error for {interval}: {e}")
+
+    async def handle_reconnection(self):
+        """Public method to trigger gap-filling after a WebSocket reconnection."""
+        await self._fill_reconnection_gap()
+
     async def _run_websocket(self):
         """Run the WebSocket connection with auto-reconnect."""
         try:
             await self.ws.connect()
+            # Schedule gap-fill as background task after (re)connecting
+            self._reconnect_fill_task = asyncio.ensure_future(
+                self._fill_reconnection_gap()
+            )
         except asyncio.CancelledError:
             pass
         except Exception as e:
